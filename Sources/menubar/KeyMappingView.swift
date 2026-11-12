@@ -1,0 +1,805 @@
+import AppKit
+import SwiftUI
+
+// MARK: 设备图
+
+/// 设备图上可以点的位置。
+enum Hotspot: Hashable {
+    case knob, mic, check, cancel
+}
+
+/// 一个外观主题的 AU05 图和图上各按键的位置。位置是 0–1 的比例，左上角为原点，按 Support 里的图量出来；
+/// 打包时没有这张图（比如直接 swift run）就用代码画的简图，位置和真图对齐。
+struct DeviceArt: Sendable {
+    /// Resources 里的图片名。
+    let imageName: String
+    /// 宽 / 高。
+    let aspect: CGFloat
+    let centers: [Hotspot: CGPoint]
+    /// 高亮圈的半径，按图宽的比例。
+    let radii: [Hotspot: CGFloat]
+
+    var image: NSImage? { NSImage(named: imageName) }
+
+    /// 标准版：DeviceArt.png，309×1000。
+    static let standard = DeviceArt(
+        imageName: "DeviceArt",
+        aspect: 0.309,
+        centers: [
+            .knob: CGPoint(x: 0.405, y: 0.320),
+            .mic: CGPoint(x: 0.420, y: 0.543),
+            .check: CGPoint(x: 0.420, y: 0.703),
+            .cancel: CGPoint(x: 0.420, y: 0.860),
+        ],
+        radii: [.knob: 0.38, .mic: 0.28, .check: 0.28, .cancel: 0.28]
+    )
+
+    /// WorkBuddy 版：DeviceArtWorkBuddy.png，308×1000。和标准版同一构图，只有旋钮略窄、略靠右。
+    static let workBuddy = DeviceArt(
+        imageName: "DeviceArtWorkBuddy",
+        aspect: 0.308,
+        centers: [
+            .knob: CGPoint(x: 0.420, y: 0.320),
+            .mic: CGPoint(x: 0.420, y: 0.543),
+            .check: CGPoint(x: 0.420, y: 0.703),
+            .cancel: CGPoint(x: 0.420, y: 0.860),
+        ],
+        radii: [.knob: 0.37, .mic: 0.28, .check: 0.28, .cancel: 0.28]
+    )
+
+    static func of(_ theme: DeviceTheme) -> DeviceArt {
+        switch theme {
+        case .standard: return .standard
+        case .workBuddy: return .workBuddy
+        }
+    }
+}
+
+/// 设备图，选中的按键套一圈强调色；`onTap` 为 nil 时只是展示。
+struct DeviceArtView: View {
+    let art: DeviceArt
+    let accent: Color
+    var highlighted: Hotspot?
+    var onTap: ((Hotspot) -> Void)?
+
+    var body: some View {
+        GeometryReader { proxy in
+            let size = proxy.size
+            ZStack(alignment: .topLeading) {
+                if let image = art.image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: size.width, height: size.height)
+                } else {
+                    SketchDevice(art: art, size: size)
+                }
+                if let onTap {
+                    ForEach([Hotspot.knob, .mic, .check, .cancel], id: \.self) { spot in
+                        let center = art.centers[spot]!
+                        let radius = (art.radii[spot] ?? 0.3) * size.width
+                        Circle()
+                            .strokeBorder(accent, lineWidth: highlighted == spot ? 2.5 : 0)
+                            .background(Circle().fill(accent.opacity(highlighted == spot ? 0.12 : 0.001)))
+                            .shadow(color: accent.opacity(highlighted == spot ? 0.45 : 0), radius: 8)
+                            .frame(width: radius * 2, height: radius * 2)
+                            .position(x: center.x * size.width, y: center.y * size.height)
+                            .onTapGesture { onTap(spot) }
+                            .help(spotName(spot))
+                    }
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.15), value: highlighted)
+    }
+
+    private func spotName(_ spot: Hotspot) -> String {
+        switch spot {
+        case .knob: return "旋钮"
+        case .mic: return "语音键"
+        case .check: return "确定键"
+        case .cancel: return "取消键"
+        }
+    }
+}
+
+/// 没有设备图时的简图：银色机身、旋钮、三个键帽。
+private struct SketchDevice: View {
+    let art: DeviceArt
+    let size: CGSize
+
+    var body: some View {
+        let w = size.width
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: w * 0.12)
+                .fill(LinearGradient(colors: [Color(white: 0.90), Color(white: 0.78)], startPoint: .topLeading, endPoint: .bottomTrailing))
+            HStack(spacing: w * 0.05) {
+                ForEach(0..<6, id: \.self) { _ in
+                    Capsule().fill(Color(white: 0.45)).frame(width: w * 0.06, height: w * 0.22)
+                }
+            }
+            .position(x: w * 0.5, y: size.height * 0.13)
+            Circle()
+                .fill(LinearGradient(colors: [Color(white: 0.96), Color(white: 0.80)], startPoint: .top, endPoint: .bottom))
+                .overlay(Circle().stroke(Color(white: 0.7), lineWidth: 1))
+                .frame(width: w * 0.78, height: w * 0.78)
+                .position(x: w * 0.5, y: art.centers[.knob]!.y * size.height)
+            ForEach([Hotspot.mic, .check, .cancel], id: \.self) { spot in
+                RoundedRectangle(cornerRadius: w * 0.06)
+                    .fill(Color(white: 0.97))
+                    .overlay(RoundedRectangle(cornerRadius: w * 0.06).stroke(Color(white: 0.75), lineWidth: 1))
+                    .overlay(Image(systemName: spot == .mic ? "mic" : spot == .check ? "checkmark.circle" : "xmark.circle")
+                        .font(.system(size: w * 0.18)).foregroundStyle(Color(white: 0.45)))
+                    .frame(width: w * 0.62, height: w * 0.62)
+                    .position(x: w * 0.5, y: art.centers[spot]!.y * size.height)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+    }
+}
+
+// MARK: 控件和它们现在做什么
+
+/// AU05 上可以设置的控件。按键页一张卡片一个。
+enum MappingControl: String, CaseIterable, Identifiable {
+    case voice, confirm, cancel, knobPress, knobTurn, knobPressTurn
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .voice: return "语音键"
+        case .confirm: return "确定键"
+        case .cancel: return "取消键"
+        case .knobPress: return "旋钮 · 按下"
+        case .knobTurn: return "旋钮 · 转动"
+        case .knobPressTurn: return "旋钮 · 按住转动"
+        }
+    }
+    var systemImage: String {
+        switch self {
+        case .voice: return "mic"
+        case .confirm: return "checkmark"
+        case .cancel: return "xmark"
+        case .knobPress: return "smallcircle.filled.circle"
+        case .knobTurn: return "arrow.left.and.right"
+        case .knobPressTurn: return "rectangle.split.3x1"
+        }
+    }
+    var hotspot: Hotspot {
+        switch self {
+        case .voice: return .mic
+        case .confirm: return .check
+        case .cancel: return .cancel
+        case .knobPress, .knobTurn, .knobPressTurn: return .knob
+        }
+    }
+    /// 按键页里卡片放在设备左边还是右边：三个键在左，旋钮在右。
+    var onLeft: Bool { [.voice, .confirm, .cancel].contains(self) }
+}
+
+/// 弹出设置的目标：卡片里的每一行。
+enum EditTarget: Hashable {
+    case confirm, cancel, knobShort, knobLong, knobTurn, knobPressTurn
+}
+
+/// 首页列表里的一行：AU05 上的一个动作，和它现在做什么。
+enum KeyFunction: CaseIterable, Identifiable {
+    case voice, confirm, cancel, knobShort, knobLong, knobTurn, knobPressTurn
+
+    var id: Self { self }
+
+    var control: MappingControl {
+        switch self {
+        case .voice: return .voice
+        case .confirm: return .confirm
+        case .cancel: return .cancel
+        case .knobShort, .knobLong: return .knobPress
+        case .knobTurn: return .knobTurn
+        case .knobPressTurn: return .knobPressTurn
+        }
+    }
+
+    struct Summary {
+        /// 做什么，比如「确定」「删到行首」。
+        let action: String
+        /// 怎么触发，比如「长按旋钮 0.5 秒」。
+        let detail: String
+        /// 画成键帽的组合键；可能有几组（左转 / 右转）。
+        let combos: [KeyCombo]
+    }
+
+    func summary(_ c: AppConfig) -> Summary {
+        let d = AppConfig()
+        switch self {
+        case .voice:
+            return Summary(action: "语音输入", detail: "语音键 · 按一下开始说，再按一下结束", combos: [KeyCombo(keyCode: 63)])
+        case .confirm:
+            return Summary(action: Self.name(c.confirm, d.confirm, "确定"), detail: "确定键", combos: [c.confirm])
+        case .cancel:
+            return Summary(action: Self.name(c.cancel, d.cancel, "取消"), detail: "取消键", combos: [c.cancel])
+        case .knobShort:
+            return Summary(action: Self.name(c.knobShortPress, d.knobShortPress, "删除"), detail: "按下旋钮",
+                           combos: [c.knobShortPress])
+        case .knobLong:
+            return Summary(action: Self.name(c.knobLongPress, d.knobLongPress, "删到行首"),
+                           detail: String(format: "长按旋钮 %.1f 秒", c.longPressSeconds), combos: [c.knobLongPress])
+        case .knobTurn:
+            if c.caretInTextFields {
+                return Summary(action: "移动光标", detail: "转动旋钮 · 输入框外滚动 \(c.scrollLines) 行",
+                               combos: [KeyCombo(keyCode: 123), KeyCombo(keyCode: 124)])
+            }
+            return Summary(action: "滚动", detail: "转动旋钮 · 每格 \(c.scrollLines) 行", combos: [])
+        case .knobPressTurn:
+            if c.switchSpacesWhilePressed {
+                return Summary(action: "切换桌面", detail: "按住旋钮转动",
+                               combos: [KeyCombo(keyCode: 123, control: true), KeyCombo(keyCode: 124, control: true)])
+            }
+            return Summary(action: "切换桌面", detail: "按住旋钮转动 · 已关闭", combos: [])
+        }
+    }
+
+    /// 默认组合用功能名（「确定」），改过的用组合的中文说明（「发送」），都没有就叫「自定义快捷键」。
+    private static func name(_ combo: KeyCombo, _ original: KeyCombo, _ fallback: String) -> String {
+        if combo.isNone { return "不发送" }
+        if combo == original { return fallback }
+        return combo.label ?? "自定义快捷键"
+    }
+}
+
+/// 按键页的界面状态（选中哪张卡片、正在编辑哪一项、录制中按住的修饰键）。
+/// 这台机器只有命令行工具，SwiftUI 的 @State 宏用不了，所以放在一个可观察对象里，由 SettingsModel 持有。
+@MainActor
+final class MappingUIState: ObservableObject {
+    @Published private(set) var selected: MappingControl?
+    /// 正在弹出设置的那一行。
+    @Published var editing: EditTarget?
+    /// 正在录制组合键时，当前按住的修饰键（比如「⌘⇧」）；没在录制时为 nil。
+    @Published var recordingLive: String?
+    /// 「自定义」里选按键的弹出面板是否打开。
+    @Published var keyPickerOpen = false
+
+    func select(_ control: MappingControl?) {
+        guard control != selected else { return }
+        selected = control
+        closeEditor()
+    }
+
+    func edit(_ target: EditTarget, of control: MappingControl) {
+        selected = control
+        recordingLive = nil
+        keyPickerOpen = false
+        editing = target
+    }
+
+    func closeEditor() {
+        editing = nil
+        recordingLive = nil
+        keyPickerOpen = false
+    }
+}
+
+// MARK: 按键页
+
+private enum AnchorID: Hashable {
+    case card(MappingControl)
+    case art
+}
+
+private struct AnchorsKey: PreferenceKey {
+    static let defaultValue: [AnchorID: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [AnchorID: Anchor<CGRect>], nextValue: () -> [AnchorID: Anchor<CGRect>]) {
+        value.merge(nextValue()) { $1 }
+    }
+}
+
+/// 按键页：设备在中间当主角，背后一圈主题色的光；两侧卡片用引线连到对应的按键上。
+/// 点设备上的键或卡片选中它；点卡片里的一行，弹出这一项的设置。
+struct KeysPage: View {
+    @ObservedObject var model: SettingsModel
+    @ObservedObject var ui: MappingUIState
+
+    private var theme: DeviceTheme { model.theme }
+    private var art: DeviceArt { DeviceArt.of(theme) }
+    private let artHeight: CGFloat = 480
+    private let cardWidth: CGFloat = 264
+
+    /// 选中的或刚刚触发的控件，卡片、引线和按键会亮起来。
+    private func isLit(_ control: MappingControl) -> Bool {
+        ui.selected == control || model.flash?.control == control
+    }
+
+    private var litSpot: Hotspot? {
+        (model.flash?.control ?? ui.selected)?.hotspot
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            PageHeader(title: "按键", subtitle: "点设备上的键或两侧的卡片，设置它发什么。改动立即生效。") {
+                if !model.keysAreDefault {
+                    Button("恢复默认") { model.resetKeys() }
+                        .buttonStyle(PillButtonStyle(kind: .subtle, height: 32))
+                }
+            }
+            Spacer(minLength: 12)
+            stage
+            Spacer(minLength: 24)
+        }
+        .padding(.horizontal, 28)
+        .padding(.top, 46)
+    }
+
+    // MARK: 展台
+
+    private var stage: some View {
+        HStack(alignment: .center, spacing: 0) {
+            column(MappingControl.allCases.filter(\.onLeft))
+            Spacer(minLength: 36)
+            ZStack {
+                Circle()
+                    .fill(RadialGradient(colors: [theme.glow.opacity(0.34), theme.glow.opacity(0)],
+                                         center: .center, startRadius: 10, endRadius: 250))
+                    .frame(width: 500, height: 500)
+                    .allowsHitTesting(false)
+                DeviceArtView(art: art, accent: theme.accent, highlighted: litSpot) { spot in
+                    if spot != ui.selected?.hotspot {
+                        ui.select(MappingControl.allCases.first { $0.hotspot == spot })
+                    }
+                }
+                .frame(width: artHeight * art.aspect, height: artHeight)
+                .anchorPreference(key: AnchorsKey.self, value: .bounds) { [.art: $0] }
+            }
+            .frame(width: artHeight * art.aspect + 40, height: artHeight)
+            .zIndex(-1)
+            Spacer(minLength: 36)
+            column(MappingControl.allCases.filter { !$0.onLeft })
+        }
+        .frame(maxWidth: .infinity)
+        .overlayPreferenceValue(AnchorsKey.self) { anchors in
+            GeometryReader { proxy in
+                leaderLines(anchors: anchors, proxy: proxy)
+            }
+            .allowsHitTesting(false)
+        }
+    }
+
+    private func column(_ controls: [MappingControl]) -> some View {
+        VStack(spacing: 14) {
+            ForEach(controls) { control in
+                card(control)
+                    .anchorPreference(key: AnchorsKey.self, value: .bounds) { [.card(control): $0] }
+            }
+        }
+        .frame(width: cardWidth)
+    }
+
+    // MARK: 卡片
+
+    private func card(_ control: MappingControl) -> some View {
+        let lit = isLit(control)
+        let accent = theme.accent
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: control.systemImage)
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(lit ? accent : Color.primary.opacity(0.8))
+                    .frame(width: 28, height: 28)
+                    .background(Circle().fill(lit ? accent.opacity(0.15) : Palette.raised))
+                Text(control.title).font(.system(size: 15, weight: .semibold))
+                Spacer()
+                if control == .voice {
+                    Text("固定")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Palette.raised))
+                }
+            }
+            rows(control)
+        }
+        .card(padding: 12, radius: 18, highlight: lit ? accent : nil)
+        .contentShape(Rectangle())
+        .onTapGesture { ui.select(control) }
+        .animation(.easeOut(duration: 0.2), value: lit)
+    }
+
+    @ViewBuilder private func rows(_ control: MappingControl) -> some View {
+        let c = model.config
+        switch control {
+        case .voice:
+            row("单击", target: nil, control: control) {
+                Keycap(text: "Fn", small: true)
+                Text("语音输入").font(.system(size: 13)).foregroundStyle(.secondary)
+            }
+        case .confirm:
+            row("单击", target: .confirm, control: control) { comboLabel(c.confirm) }
+        case .cancel:
+            row("单击", target: .cancel, control: control) { comboLabel(c.cancel) }
+        case .knobPress:
+            row("短按", target: .knobShort, control: control) { comboLabel(c.knobShortPress) }
+            row("长按", target: .knobLong, control: control) {
+                ComboKeycaps(combo: c.knobLongPress, small: true)
+                Text(String(format: "%.1f 秒", c.longPressSeconds)).font(.system(size: 13)).foregroundStyle(.secondary)
+            }
+        case .knobTurn:
+            row("左右转", target: .knobTurn, control: control) {
+                Text("滚动 \(c.scrollLines) 行\(c.reverseScroll ? "（反向）" : "")").font(.system(size: 13))
+            }
+            row("输入框里", target: .knobTurn, control: control) {
+                Text(c.caretInTextFields ? "移动光标" : "也滚动").font(.system(size: 13))
+            }
+        case .knobPressTurn:
+            row("左右转", target: .knobPressTurn, control: control) {
+                if c.switchSpacesWhilePressed {
+                    ComboKeycaps(combo: KeyCombo(keyCode: 123, control: true), small: true)
+                    ComboKeycaps(combo: KeyCombo(keyCode: 124, control: true), small: true)
+                } else {
+                    Text("已关闭").font(.system(size: 13)).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func comboLabel(_ combo: KeyCombo) -> some View {
+        ComboKeycaps(combo: combo, small: true)
+        if let label = combo.label, label != combo.parts.last {
+            Text(label).font(.system(size: 13)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// 卡片里的一行：左边是动作（单击 / 长按 …），右边是现在发什么；点一下弹出设置。
+    private func row<Trailing: View>(
+        _ label: String, target: EditTarget?, control: MappingControl,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        Button {
+            if let target {
+                ui.edit(target, of: control)
+            } else {
+                ui.select(control)
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text(label).font(.system(size: 13)).foregroundStyle(.secondary)
+                Spacer(minLength: 6)
+                trailing().lineLimit(1)
+                if target != nil {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(minHeight: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(target != nil && ui.editing == target ? theme.accent.opacity(0.12) : Palette.raised.opacity(0.6))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: Binding(
+            get: { target != nil && ui.editing == target },
+            set: { if !$0 { ui.closeEditor() } }
+        ), arrowEdge: control.onLeft ? .leading : .trailing) {
+            if let target { editor(for: target) }
+        }
+    }
+
+    // MARK: 弹出的设置
+
+    @ViewBuilder private func editor(for target: EditTarget) -> some View {
+        let accent = theme.accent
+        switch target {
+        case .confirm:
+            PopoverPanel(title: "确定键 · 单击") {
+                ComboEditor(combo: $model.config.confirm, ui: ui, accent: accent)
+            }
+        case .cancel:
+            PopoverPanel(title: "取消键 · 单击") {
+                ComboEditor(combo: $model.config.cancel, ui: ui, accent: accent)
+            }
+        case .knobShort:
+            PopoverPanel(title: "旋钮 · 短按") {
+                ComboEditor(combo: $model.config.knobShortPress, ui: ui, accent: accent)
+            }
+        case .knobLong:
+            PopoverPanel(title: "旋钮 · 长按") {
+                ComboEditor(combo: $model.config.knobLongPress, ui: ui, accent: accent)
+                RowDivider()
+                HStack(spacing: 12) {
+                    Text("按住多久算长按").font(.system(size: 14, weight: .medium))
+                    Slider(value: $model.config.longPressSeconds, in: 0.3...1.5, step: 0.1)
+                    Text(String(format: "%.1f 秒", model.config.longPressSeconds))
+                        .font(.system(size: 14, weight: .medium))
+                        .monospacedDigit()
+                }
+                Note("松手时才发送；按住期间转动旋钮切换过桌面，就什么都不发。")
+            }
+        case .knobTurn:
+            PopoverPanel(title: "旋钮 · 转动", width: 440) {
+                VStack(spacing: 0) {
+                    SettingRow(title: "在输入框里移动光标",
+                               detail: "焦点在输入框里、并且鼠标停在这个输入框上时，转动旋钮左右移动光标；其他地方照常滚动。") {
+                        AccentSwitch(isOn: $model.config.caretInTextFields, accent: accent)
+                    }
+                    RowDivider()
+                    SettingRow(title: "反转光标方向") {
+                        AccentSwitch(isOn: $model.config.reverseCaret, accent: accent)
+                    }
+                    .disabled(!model.config.caretInTextFields)
+                    RowDivider()
+                    SettingRow(title: "每格滚动行数") {
+                        HStack(spacing: 8) {
+                            Text("\(model.config.scrollLines) 行").font(.system(size: 14, weight: .medium)).monospacedDigit()
+                            Stepper("", value: $model.config.scrollLines, in: 1...10).labelsHidden()
+                        }
+                    }
+                    RowDivider()
+                    SettingRow(title: "反转滚动方向") {
+                        AccentSwitch(isOn: $model.config.reverseScroll, accent: accent)
+                    }
+                }
+            }
+        case .knobPressTurn:
+            PopoverPanel(title: "旋钮 · 按住转动", width: 440) {
+                SettingRow(title: "按住旋钮转动切换桌面",
+                           detail: "相当于 Control + ← / →。需要在「系统设置 → 键盘 → 键盘快捷键 → 调度中心」里开着「向左 / 向右移动一个空间」。") {
+                    AccentSwitch(isOn: $model.config.switchSpacesWhilePressed, accent: accent)
+                }
+            }
+        }
+    }
+
+    // MARK: 引线
+
+    private func leaderLines(anchors: [AnchorID: Anchor<CGRect>], proxy: GeometryProxy) -> some View {
+        let art = anchors[.art].map { proxy[$0] }
+        let spec = self.art
+        return ZStack {
+            if let art {
+                ForEach(MappingControl.allCases) { control in
+                    if let anchor = anchors[.card(control)] {
+                        let cardRect = proxy[anchor]
+                        let spot = spec.centers[control.hotspot]!
+                        let radius = (spec.radii[control.hotspot] ?? 0.3) * art.width
+                        let center = CGPoint(x: art.minX + spot.x * art.width, y: art.minY + spot.y * art.height)
+                        let start = CGPoint(x: control.onLeft ? cardRect.maxX : cardRect.minX, y: cardRect.midY)
+                        let end = CGPoint(x: center.x + (control.onLeft ? -radius : radius), y: center.y)
+                        let lit = isLit(control)
+                        Path { path in
+                            path.move(to: start)
+                            let mid = (start.x + end.x) / 2
+                            path.addCurve(to: end, control1: CGPoint(x: mid, y: start.y), control2: CGPoint(x: mid, y: end.y))
+                        }
+                        .stroke(lit ? theme.accent : Color.primary.opacity(0.22),
+                                style: StrokeStyle(lineWidth: lit ? 2 : 1, lineCap: .round))
+                        Circle()
+                            .fill(lit ? theme.accent : Color.primary.opacity(0.4))
+                            .frame(width: 6, height: 6)
+                            .position(end)
+                        Circle()
+                            .fill(lit ? theme.accent : Color.primary.opacity(0.4))
+                            .frame(width: 5, height: 5)
+                            .position(start)
+                    }
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: model.flash?.id)
+    }
+}
+
+/// 弹出面板：标题加内容。
+private struct PopoverPanel<Content: View>: View {
+    let title: String
+    var width: CGFloat = 480
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title).font(.system(size: 17, weight: .bold))
+            content()
+        }
+        .padding(20)
+        .frame(width: width)
+    }
+}
+
+// MARK: 组合键编辑
+
+/// 三种方式设置一个组合键：录制（在本窗口里按一次）、从常用里点选、用 ⌃⌥⇧⌘ 加一个键自由组合。
+struct ComboEditor: View {
+    @Binding var combo: KeyCombo
+    @ObservedObject var ui: MappingUIState
+    let accent: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                ShortcutRecorderRow(ui: ui, accent: accent) { combo = $0 }
+                Text("只在这个框被点中时读取你按下的一次组合键，不监听系统，也不需要额外权限。⌘Tab、⌘空格、⌃← / → 这类系统快捷键录不到，可以在下面选。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                caption("常用")
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 124), spacing: 8)], spacing: 8) {
+                    ForEach(KeyPresets.options.map(\.0) + [KeyCombo.none], id: \.self) { preset in
+                        presetChip(preset)
+                    }
+                }
+            }
+            HStack(spacing: 6) {
+                caption("自定义").padding(.trailing, 6)
+                modifier("⌃", "Control", $combo.control)
+                modifier("⌥", "Option", $combo.option)
+                modifier("⇧", "Shift", $combo.shift)
+                modifier("⌘", "Command", $combo.command)
+                Text("+").foregroundStyle(.secondary).padding(.horizontal, 2)
+                KeyPickerButton(combo: $combo, ui: ui, accent: accent)
+                Spacer()
+            }
+        }
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+    }
+
+    private func presetChip(_ preset: KeyCombo) -> some View {
+        let selected = combo == preset
+        let label = preset.isNone ? nil : preset.label
+        return Button {
+            combo = preset
+        } label: {
+            HStack(spacing: 7) {
+                ComboKeycaps(combo: preset, small: true)
+                if let label, label != preset.parts.last {
+                    Text(label).font(.system(size: 12.5)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 9)
+            .frame(height: 36)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected ? accent.opacity(0.12) : Palette.raised.opacity(0.55))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(selected ? accent : .clear, lineWidth: 1.5)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func modifier(_ symbol: String, _ name: String, _ isOn: Binding<Bool>) -> some View {
+        let on = isOn.wrappedValue
+        return Button {
+            isOn.wrappedValue.toggle()
+        } label: {
+            Text(symbol)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(on ? Color.white : Color.primary)
+                .frame(width: 30, height: 28)
+                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(on ? accent : Palette.raised))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(name)
+        .disabled(combo.isNone)
+        .opacity(combo.isNone ? 0.4 : 1)
+    }
+}
+
+/// 「自定义」里选主键：点开一个面板，按分组列出所有键帽。
+private struct KeyPickerButton: View {
+    @Binding var combo: KeyCombo
+    @ObservedObject var ui: MappingUIState
+    let accent: Color
+
+    var body: some View {
+        Button {
+            ui.keyPickerOpen.toggle()
+        } label: {
+            HStack(spacing: 8) {
+                if combo.isNone {
+                    Text("选择按键").font(.system(size: 13)).foregroundStyle(.secondary)
+                } else {
+                    Keycap(text: KeyCombo.keyName(combo.keyCode), small: true)
+                }
+                Image(systemName: "chevron.down").font(.system(size: 10, weight: .bold)).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Palette.raised))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $ui.keyPickerOpen, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(KeyCatalog.groups) { group in
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(group.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
+                        FlowLayout(spacing: 6) {
+                            ForEach(group.keys, id: \.code) { key in
+                                keyButton(key.code, key.name)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(18)
+            .frame(width: 460)
+        }
+    }
+
+    private func keyButton(_ code: UInt16, _ name: String) -> some View {
+        let selected = combo.keyCode == code
+        return Button {
+            combo.keyCode = code
+            ui.keyPickerOpen = false
+        } label: {
+            Keycap(text: name, small: true)
+                .frame(minWidth: 34)
+                .padding(4)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(selected ? accent.opacity(0.15) : .clear)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(selected ? accent : .clear, lineWidth: 1.5)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 从左到右排、排满换行。
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+        let height = rows.last.map { $0.y + $0.height } ?? 0
+        let width = rows.map(\.width).max() ?? 0
+        return CGSize(width: proposal.width ?? width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = arrange(width: bounds.width, subviews: subviews)
+        for row in rows {
+            var x = bounds.minX
+            for index in row.indices {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: bounds.minY + row.y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+            }
+        }
+    }
+
+    private struct Row { var indices: [Int] = []; var y: CGFloat = 0; var width: CGFloat = 0; var height: CGFloat = 0 }
+
+    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        for index in subviews.indices {
+            let size = subviews[index].sizeThatFits(.unspecified)
+            let needed = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            if needed > width, !current.indices.isEmpty {
+                rows.append(current)
+                current = Row(y: current.y + current.height + spacing)
+            }
+            current.width = current.indices.isEmpty ? size.width : current.width + spacing + size.width
+            current.height = max(current.height, size.height)
+            current.indices.append(index)
+        }
+        if !current.indices.isEmpty { rows.append(current) }
+        return rows
+    }
+}

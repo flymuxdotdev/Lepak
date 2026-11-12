@@ -18,6 +18,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recent = "还没有按键"
     private var linkLost = false
     private var updatingMenu = false
+    private let settings = SettingsModel()
+    private lazy var settingsWindow = SettingsWindowController(model: settings)
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
@@ -50,6 +53,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self?.status = status
                 self?.show(status)
+                self?.settings.update(status: status, linkLost: self?.linkLost ?? false)
             }
         }
         session.onVendorKey = { [weak self] event in
@@ -59,6 +63,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     ? FunctionKey.handle(pressed: event.status == 1)
                     : false
                 note = event.status == 1 ? (sent ? "已按下 Fn" : "Fn 未发出") : nil
+                if event.status == 1, sent {
+                    DeviceKeys.report(.voice, "语音输入", KeyCombo(keyCode: FunctionKey.virtualKey))
+                }
             } else {
                 note = DeviceKeys.handle(physicalIndex: event.physicalIndex, status: event.status)
             }
@@ -80,6 +87,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         session.onNote = { [weak self] line in
             Task { @MainActor in
                 self?.log(line)
+            }
+        }
+        DeviceKeys.setActionHandler { [weak self] control, title, combo in
+            Task { @MainActor in
+                self?.settings.record(control, title, combo)
             }
         }
         FunctionKey.requestTrust()
@@ -124,6 +136,37 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.session.refresh()
             }
         }
+        SettingsWindowController.installMainMenu(openSettings: #selector(openSettings), target: self)
+        watchWorkspace()
+    }
+
+    /// 日常稳定性：睡眠唤醒后立刻补发心跳（等下一次计时器可能已经超过 AU05 的 3 秒），
+    /// 并留意 Ulanzi Studio 的启动和退出——它和本程序同时运行会抢 AU05。
+    private func watchWorkspace() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.session.keepAlive()
+                self?.session.refresh()
+                self?.log("唤醒后已补发心跳")
+            }
+        })
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            workspaceObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                guard app?.bundleIdentifier == SettingsModel.ulanziBundleID else { return }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.settings.refreshUlanzi()
+                    self.log(self.settings.ulanziRunning ? "Ulanzi Studio 已启动，可能和 Vibe Key 抢 AU05" : "Ulanzi Studio 已退出")
+                }
+            })
+        }
+        if settings.ulanziRunning {
+            log("Ulanzi Studio 正在运行，可能和 Vibe Key 抢 AU05")
+        }
     }
 
     /// 有图标时菜单栏只显示图标（电量在菜单里看），没连上时图标变灰；
@@ -166,24 +209,45 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
+        settings.refreshUlanzi()
         if let status {
-            menu.addItem(title: "电量 \(status.percent)%", action: nil)
-            menu.addItem(title: "电压 \(status.menuVoltage)", action: nil)
-            menu.addItem(title: status.charging ? "正在充电" : "未在充电", action: nil)
-        } else if linkLost {
-            menu.addItem(title: "配置口未连接", action: nil)
+            menu.addItem(title: "AU05 已连接 · 电量 \(status.percent)%\(status.charging ? " · 充电中" : "")", action: nil)
         } else {
-            menu.addItem(title: "正在连接配置口", action: nil)
+            menu.addItem(title: linkLost ? "AU05 未连接" : "正在连接 AU05…", action: nil)
+        }
+        if !FunctionKey.isTrusted {
+            let item = menu.addItem(withTitle: "⚠️ 辅助功能未允许，按键发不出去…", action: #selector(openPermissions), keyEquivalent: "")
+            item.target = self
+        }
+        if settings.ulanziRunning {
+            let item = menu.addItem(withTitle: "⚠️ Ulanzi Studio 正在运行，可能冲突…", action: #selector(openDevicePage), keyEquivalent: "")
+            item.target = self
         }
         menu.addItem(.separator())
-        menu.addItem(title: FunctionKey.isTrusted ? "调试：对照系统按键" : "辅助功能未允许，Fn 发不出", action: nil)
-        menu.addItem(title: recent, action: nil)
+        let settingsItem = menu.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
         menu.addItem(.separator())
-        let refresh = menu.addItem(withTitle: "刷新", action: #selector(refresh), keyEquivalent: "r")
+        let debugMenu = NSMenu()
+        debugMenu.addItem(title: "最近：\(recent)", action: nil)
+        let refresh = debugMenu.addItem(withTitle: "刷新电量", action: #selector(refresh), keyEquivalent: "")
         refresh.target = self
+        let debug = menu.addItem(withTitle: "调试", action: nil, keyEquivalent: "")
+        debug.submenu = debugMenu
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "退出", action: #selector(quit), keyEquivalent: "q")
+        let quit = menu.addItem(withTitle: "退出 Vibe Key", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
+    }
+
+    @objc private func openSettings() {
+        settingsWindow.show()
+    }
+
+    @objc private func openPermissions() {
+        settingsWindow.show(section: .general)
+    }
+
+    @objc private func openDevicePage() {
+        settingsWindow.show(section: .device)
     }
 
     private func log(_ line: String) {
@@ -212,6 +276,13 @@ private extension NSMenu {
         addItem(item)
         return item
     }
+}
+
+// 开发用：离屏画出设置界面后退出，不建菜单栏图标、不连设备。
+if let flag = CommandLine.arguments.firstIndex(of: "--snapshot-settings"), flag + 1 < CommandLine.arguments.count {
+    NSApplication.shared.setActivationPolicy(.accessory)
+    SettingsWindowController.snapshotAll(to: URL(fileURLWithPath: CommandLine.arguments[flag + 1]))
+    exit(0)
 }
 
 let app = MenuBarApp()

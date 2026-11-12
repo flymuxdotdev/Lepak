@@ -20,6 +20,9 @@
 
 - 读写 AU05 配置口（Usage Page `0xFFFC`）：`DeviceSession`、`probe` 都只匹配这个接口。语音键、确定、取消、旋钮都从这里上报。
 - 用 `CGEvent.post` 发出按键或滚轮事件（Fn、Return、Esc、退格、滚轮）。这是「发」，不是「听」，只需要「辅助功能」权限。
+- **设置窗口里的快捷键录制框**（`Sources/menubar/ShortcutRecorder.swift`，用户 2026-11-12 确认）：只在用户点了录制框、并且它是本窗口的焦点时，通过本窗口自己的按键事件（响应链里的 `keyDown` / `performKeyEquivalent` / `flagsChanged`）读取一次组合键，录完立刻停止并交出焦点。不用 CGEventTap、NSEvent 监听或 IOHID，不申请「输入监控」，不写日志。
+
+用户定的界线：**不能监听整个系统的输入，也不能申请「输入监控」这类键盘监听权限**（用户对它很敏感）；在特定时机、只在本程序自己的窗口里读取按键是可以的。
 
 ### 规则
 
