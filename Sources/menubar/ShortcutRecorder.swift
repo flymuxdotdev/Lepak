@@ -7,6 +7,9 @@ import SwiftUI
 /// 通过本窗口自己的按键事件（响应链里的 keyDown / performKeyEquivalent / flagsChanged）读取一次组合键，
 /// 录完立刻停止并交出焦点。不用 CGEventTap、NSEvent 监听或 IOHID，不申请「输入监控」，不写日志。
 /// 系统先拦下的快捷键（⌘Tab、⌘空格、⌃←/→ 等）到不了这里，录不到，只能从预设里选。
+///
+/// 只按修饰键也能录（比如只按 Fn，或按住 Fn 再按左 Shift）：一直没按普通键、修饰键全部松开时，
+/// 最后按下的那个修饰键当主键，前面按住的当修饰键。
 final class RecorderNSView: NSView {
     var onStart: (@MainActor () -> Void)?
     var onLive: (@MainActor (String) -> Void)?
@@ -14,6 +17,10 @@ final class RecorderNSView: NSView {
     var onRecord: (@MainActor (KeyCombo) -> Void)?
 
     private var isRecording = false
+    /// 录制中现在按住的修饰键（键码，按按下的顺序）。
+    private var heldModifiers: [UInt16] = []
+    /// 这一下按过的所有修饰键（按按下的顺序），全部松开时用它组成组合。
+    private var chord: [UInt16] = []
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -22,6 +29,8 @@ final class RecorderNSView: NSView {
             stop()
         } else if window?.makeFirstResponder(self) == true {
             isRecording = true
+            heldModifiers = []
+            chord = []
             onStart?()
         }
     }
@@ -63,24 +72,58 @@ final class RecorderNSView: NSView {
             super.flagsChanged(with: event)
             return
         }
-        onLive?(Self.symbols(event.modifierFlags))
+        let code = event.keyCode
+        if ModifierKey.all[code] != nil {
+            if heldModifiers.contains(code) {
+                heldModifiers.removeAll { $0 == code }
+            } else {
+                heldModifiers.append(code)
+                if !chord.contains(code) { chord.append(code) }
+            }
+            if heldModifiers.isEmpty, let last = chord.last {
+                // 只按了修饰键，现在全部松开了：录下来。
+                var combo = KeyCombo(keyCode: last)
+                for code in chord.dropLast() {
+                    switch code {
+                    case 63: combo.fn = true
+                    case 56, 60: combo.shift = true
+                    case 59, 62: combo.control = true
+                    case 58, 61: combo.option = true
+                    case 55, 54: combo.command = true
+                    default: break
+                    }
+                }
+                stop()
+                onRecord?(combo)
+                return
+            }
+        }
+        onLive?(liveSymbols(event.modifierFlags))
     }
 
     private func capture(_ event: NSEvent) {
         let flags = event.modifierFlags
+        // Fn 看是不是真的按住了 Fn 键：方向键、F1–F12 这些键系统自己就会带上 Fn 标志。
         let combo = KeyCombo(
             keyCode: event.keyCode,
             command: flags.contains(.command),
             shift: flags.contains(.shift),
             option: flags.contains(.option),
-            control: flags.contains(.control)
+            control: flags.contains(.control),
+            fn: heldModifiers.contains(ModifierKey.fn)
         )
         stop()
         onRecord?(combo)
     }
 
+    private func liveSymbols(_ flags: NSEvent.ModifierFlags) -> String {
+        (heldModifiers.contains(ModifierKey.fn) ? "Fn " : "") + Self.symbols(flags)
+    }
+
     private func stop() {
         isRecording = false
+        heldModifiers = []
+        chord = []
         if window?.firstResponder === self {
             window?.makeFirstResponder(nil)
         }

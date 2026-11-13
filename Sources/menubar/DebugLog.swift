@@ -2,7 +2,7 @@ import Foundation
 
 enum DebugLog {
     static let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/VibeKey.log")
+        .appendingPathComponent("Library/Logs/Lepak.log")
     private static let lock = NSLock()
 
     static func stamp() -> String {

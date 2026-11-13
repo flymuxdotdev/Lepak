@@ -179,70 +179,25 @@ enum MappingControl: String, CaseIterable, Identifiable {
 
 /// 弹出设置的目标：卡片里的每一行。
 enum EditTarget: Hashable {
-    case confirm, cancel, knobShort, knobLong, knobTurn, knobPressTurn
+    /// 语音 / 确定 / 取消键的单击。
+    case single(GestureKey)
+    /// 语音 / 确定 / 取消键另外开启的长按或双击。
+    case gesture(GestureKey, KeyGesture)
+    case knobShort, knobLong, knobTurn, knobPressTurn
 }
 
-/// 首页列表里的一行：AU05 上的一个动作，和它现在做什么。
-enum KeyFunction: CaseIterable, Identifiable {
-    case voice, confirm, cancel, knobShort, knobLong, knobTurn, knobPressTurn
-
-    var id: Self { self }
-
+extension GestureKey {
     var control: MappingControl {
         switch self {
         case .voice: return .voice
         case .confirm: return .confirm
         case .cancel: return .cancel
-        case .knobShort, .knobLong: return .knobPress
-        case .knobTurn: return .knobTurn
-        case .knobPressTurn: return .knobPressTurn
         }
     }
 
-    struct Summary {
-        /// 做什么，比如「确定」「删到行首」。
-        let action: String
-        /// 怎么触发，比如「长按旋钮 0.5 秒」。
-        let detail: String
-        /// 画成键帽的组合键；可能有几组（左转 / 右转）。
-        let combos: [KeyCombo]
-    }
-
-    func summary(_ c: AppConfig) -> Summary {
-        let d = AppConfig()
-        switch self {
-        case .voice:
-            return Summary(action: "语音输入", detail: "语音键 · 按一下开始说，再按一下结束", combos: [KeyCombo(keyCode: 63)])
-        case .confirm:
-            return Summary(action: Self.name(c.confirm, d.confirm, "确定"), detail: "确定键", combos: [c.confirm])
-        case .cancel:
-            return Summary(action: Self.name(c.cancel, d.cancel, "取消"), detail: "取消键", combos: [c.cancel])
-        case .knobShort:
-            return Summary(action: Self.name(c.knobShortPress, d.knobShortPress, "删除"), detail: "按下旋钮",
-                           combos: [c.knobShortPress])
-        case .knobLong:
-            return Summary(action: Self.name(c.knobLongPress, d.knobLongPress, "删到行首"),
-                           detail: String(format: "长按旋钮 %.1f 秒", c.longPressSeconds), combos: [c.knobLongPress])
-        case .knobTurn:
-            if c.caretInTextFields {
-                return Summary(action: "移动光标", detail: "转动旋钮 · 输入框外滚动 \(c.scrollLines) 行",
-                               combos: [KeyCombo(keyCode: 123), KeyCombo(keyCode: 124)])
-            }
-            return Summary(action: "滚动", detail: "转动旋钮 · 每格 \(c.scrollLines) 行", combos: [])
-        case .knobPressTurn:
-            if c.switchSpacesWhilePressed {
-                return Summary(action: "切换桌面", detail: "按住旋钮转动",
-                               combos: [KeyCombo(keyCode: 123, control: true), KeyCombo(keyCode: 124, control: true)])
-            }
-            return Summary(action: "切换桌面", detail: "按住旋钮转动 · 已关闭", combos: [])
-        }
-    }
-
-    /// 默认组合用功能名（「确定」），改过的用组合的中文说明（「发送」），都没有就叫「自定义快捷键」。
-    private static func name(_ combo: KeyCombo, _ original: KeyCombo, _ fallback: String) -> String {
-        if combo.isNone { return "不发送" }
-        if combo == original { return fallback }
-        return combo.label ?? "自定义快捷键"
+    init?(control: MappingControl) {
+        guard let key = Self.allCases.first(where: { $0.control == control }) else { return nil }
+        self = key
     }
 }
 
@@ -300,8 +255,16 @@ struct KeysPage: View {
 
     private var theme: DeviceTheme { model.theme }
     private var art: DeviceArt { DeviceArt.of(theme) }
-    private let artHeight: CGFloat = 480
-    private let cardWidth: CGFloat = 264
+
+    /// 展台的尺寸：设备图高度、两侧卡片宽度、卡片和设备之间的最小间距。
+    private struct StageSize {
+        let artHeight: CGFloat
+        let cardWidth: CGFloat
+        let gap: CGFloat
+    }
+    /// 窗口够大时用标准尺寸（约 790pt 宽、480pt 高）；放不下就换紧凑尺寸（约 690×400，窗口最小 1000×660 时也放得下）。
+    private static let regular = StageSize(artHeight: 480, cardWidth: 264, gap: 36)
+    private static let compact = StageSize(artHeight: 400, cardWidth: 248, gap: 16)
 
     /// 选中的或刚刚触发的控件，卡片、引线和按键会亮起来。
     private func isLit(_ control: MappingControl) -> Bool {
@@ -312,33 +275,36 @@ struct KeysPage: View {
         (model.flash?.control ?? ui.selected)?.hotspot
     }
 
+    /// 设备页的按键展台（标题、款式切换和「恢复默认」在设备页顶上）。
+    /// 占满标题下面剩下的地方：宽和高都放得下标准尺寸就用标准尺寸，否则用紧凑尺寸；
+    /// 紧凑尺寸也放不下（窗口很矮、长按双击全开、又有提醒条）就让紧凑展台上下滚动，不把窗口撑高。
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            PageHeader(title: "按键", subtitle: "点设备上的键或两侧的卡片，设置它发什么。改动立即生效。") {
-                if !model.keysAreDefault {
-                    Button("恢复默认") { model.resetKeys() }
-                        .buttonStyle(PillButtonStyle(kind: .subtle, height: 32))
-                }
+        ViewThatFits(in: [.horizontal, .vertical]) {
+            stage(Self.regular)
+            stage(Self.compact)
+            ScrollView(.vertical) {
+                stage(Self.compact)
             }
-            Spacer(minLength: 12)
-            stage
-            Spacer(minLength: 24)
         }
+        .padding(.top, 12)
+        .padding(.bottom, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 28)
-        .padding(.top, 46)
     }
 
     // MARK: 展台
 
-    private var stage: some View {
-        HStack(alignment: .center, spacing: 0) {
-            column(MappingControl.allCases.filter(\.onLeft))
-            Spacer(minLength: 36)
+    private func stage(_ size: StageSize) -> some View {
+        let artHeight = size.artHeight
+        let glow = artHeight * 500 / 480
+        return HStack(alignment: .center, spacing: 0) {
+            column(MappingControl.allCases.filter(\.onLeft), width: size.cardWidth)
+            Spacer(minLength: size.gap)
             ZStack {
                 Circle()
                     .fill(RadialGradient(colors: [theme.glow.opacity(0.34), theme.glow.opacity(0)],
-                                         center: .center, startRadius: 10, endRadius: 250))
-                    .frame(width: 500, height: 500)
+                                         center: .center, startRadius: 10, endRadius: glow / 2))
+                    .frame(width: glow, height: glow)
                     .allowsHitTesting(false)
                 DeviceArtView(art: art, accent: theme.accent, highlighted: litSpot) { spot in
                     if spot != ui.selected?.hotspot {
@@ -350,8 +316,8 @@ struct KeysPage: View {
             }
             .frame(width: artHeight * art.aspect + 40, height: artHeight)
             .zIndex(-1)
-            Spacer(minLength: 36)
-            column(MappingControl.allCases.filter { !$0.onLeft })
+            Spacer(minLength: size.gap)
+            column(MappingControl.allCases.filter { !$0.onLeft }, width: size.cardWidth)
         }
         .frame(maxWidth: .infinity)
         .overlayPreferenceValue(AnchorsKey.self) { anchors in
@@ -362,14 +328,14 @@ struct KeysPage: View {
         }
     }
 
-    private func column(_ controls: [MappingControl]) -> some View {
+    private func column(_ controls: [MappingControl], width: CGFloat) -> some View {
         VStack(spacing: 14) {
             ForEach(controls) { control in
                 card(control)
                     .anchorPreference(key: AnchorsKey.self, value: .bounds) { [.card(control): $0] }
             }
         }
-        .frame(width: cardWidth)
+        .frame(width: width)
     }
 
     // MARK: 卡片
@@ -386,13 +352,8 @@ struct KeysPage: View {
                     .background(Circle().fill(lit ? accent.opacity(0.15) : Palette.raised))
                 Text(control.title).font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if control == .voice {
-                    Text("固定")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Palette.raised))
+                if let key = GestureKey(control: control) {
+                    addGestureButtons(key)
                 }
             }
             rows(control)
@@ -406,15 +367,21 @@ struct KeysPage: View {
     @ViewBuilder private func rows(_ control: MappingControl) -> some View {
         let c = model.config
         switch control {
-        case .voice:
-            row("单击", target: nil, control: control) {
-                Keycap(text: "Fn", small: true)
-                Text("语音输入").font(.system(size: 13)).foregroundStyle(.secondary)
+        case .voice, .confirm, .cancel:
+            if let key = GestureKey(control: control) {
+                VStack(spacing: 6) {
+                    row("单击", target: .single(key), control: control) {
+                        comboLabel(c[keyPath: key.singlePath])
+                    }
+                    ForEach(KeyGesture.allCases) { gesture in
+                        if let combo = c[keyPath: key.gesturePath(gesture)] {
+                            row(gesture.title, target: .gesture(key, gesture), control: control) {
+                                comboLabel(combo)
+                            }
+                        }
+                    }
+                }
             }
-        case .confirm:
-            row("单击", target: .confirm, control: control) { comboLabel(c.confirm) }
-        case .cancel:
-            row("单击", target: .cancel, control: control) { comboLabel(c.cancel) }
         case .knobPress:
             row("短按", target: .knobShort, control: control) { comboLabel(c.knobShortPress) }
             row("长按", target: .knobLong, control: control) {
@@ -435,6 +402,31 @@ struct KeysPage: View {
                     ComboKeycaps(combo: KeyCombo(keyCode: 124, control: true), small: true)
                 } else {
                     Text("已关闭").font(.system(size: 13)).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    /// 卡片标题右边的小按钮：「+ 长按」「+ 双击」，已经开启的不再显示。点了先给一个常用组合并弹出设置。
+    @ViewBuilder private func addGestureButtons(_ key: GestureKey) -> some View {
+        HStack(spacing: 4) {
+            ForEach(KeyGesture.allCases) { gesture in
+                let path = key.gesturePath(gesture)
+                if model.config[keyPath: path] == nil {
+                    Button {
+                        model.config[keyPath: path] = key.suggestedCombo(gesture)
+                        ui.edit(.gesture(key, gesture), of: key.control)
+                    } label: {
+                        Text("+ \(gesture.title)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 7)
+                            .frame(height: 20)
+                            .background(Capsule().fill(Palette.raised))
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help(gesture == .long ? "开启长按：按住发另一个组合键" : "开启双击：快速按两下发另一个组合键")
                 }
             }
         }
@@ -491,14 +483,13 @@ struct KeysPage: View {
     @ViewBuilder private func editor(for target: EditTarget) -> some View {
         let accent = theme.accent
         switch target {
-        case .confirm:
-            PopoverPanel(title: "确定键 · 单击") {
-                ComboEditor(combo: $model.config.confirm, ui: ui, accent: accent)
+        case let .single(key):
+            PopoverPanel(title: "\(key.title) · 单击") {
+                ComboEditor(combo: $model.config[dynamicMember: key.singlePath], ui: ui, accent: accent)
+                singleClickNote(key)
             }
-        case .cancel:
-            PopoverPanel(title: "取消键 · 单击") {
-                ComboEditor(combo: $model.config.cancel, ui: ui, accent: accent)
-            }
+        case let .gesture(key, gesture):
+            gestureEditor(key, gesture)
         case .knobShort:
             PopoverPanel(title: "旋钮 · 短按") {
                 ComboEditor(combo: $model.config.knobShortPress, ui: ui, accent: accent)
@@ -547,6 +538,55 @@ struct KeysPage: View {
                            detail: "相当于 Control + ← / →。需要在「系统设置 → 键盘 → 键盘快捷键 → 调度中心」里开着「向左 / 向右移动一个空间」。") {
                     AccentSwitch(isOn: $model.config.switchSpacesWhilePressed, accent: accent)
                 }
+            }
+        }
+    }
+
+    /// 单击的设置下面的说明：语音键说一下默认的 Fn；开了长按 / 双击时说明单击现在什么时候发。
+    @ViewBuilder private func singleClickNote(_ key: GestureKey) -> some View {
+        let c = model.config
+        let long = c[keyPath: key.gesturePath(.long)] != nil
+        let double = c[keyPath: key.gesturePath(.double)] != nil
+        if long || double {
+            RowDivider()
+            Note(double
+                 ? "开了双击：松手后要等 \(Int(doubleClickWindow * 1000)) 毫秒确认没有第二下，单击才发出去。"
+                 : "开了长按：松手时才发单击，不再是一按下就发。")
+        } else if key == .voice {
+            RowDivider()
+            Note("默认是 Fn：Typeless 等语音输入用它开始和结束说话。")
+        }
+    }
+
+    private func gestureEditor(_ key: GestureKey, _ gesture: KeyGesture) -> some View {
+        let path = key.gesturePath(gesture)
+        let combo = Binding<KeyCombo>(
+            get: { model.config[keyPath: path] ?? .none },
+            set: { model.config[keyPath: path] = $0 }
+        )
+        return PopoverPanel(title: "\(key.title) · \(gesture.title)") {
+            ComboEditor(combo: combo, ui: ui, accent: theme.accent)
+            RowDivider()
+            if gesture == .long {
+                HStack(spacing: 12) {
+                    Text("按住多久算长按").font(.system(size: 14, weight: .medium))
+                    Slider(value: $model.config.longPressSeconds, in: 0.3...1.5, step: 0.1)
+                    Text(String(format: "%.1f 秒", model.config.longPressSeconds))
+                        .font(.system(size: 14, weight: .medium))
+                        .monospacedDigit()
+                }
+                Note("按住到这个时长就发长按。开启后单击改成松手时才发。这个时长和旋钮长按共用。")
+            } else {
+                Note("快速按两下发这个组合。开启后单击会慢一点：松手后要等 \(Int(doubleClickWindow * 1000)) 毫秒确认没有第二下，单击才发出去。")
+            }
+            HStack {
+                Spacer()
+                Button("关闭\(gesture.title)") {
+                    ui.closeEditor()
+                    // 等弹出面板收起，再去掉它所在的那一行。
+                    DispatchQueue.main.async { model.config[keyPath: path] = nil }
+                }
+                .buttonStyle(PillButtonStyle(kind: .subtle, height: 30))
             }
         }
     }
@@ -618,7 +658,7 @@ struct ComboEditor: View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 ShortcutRecorderRow(ui: ui, accent: accent) { combo = $0 }
-                Text("只在这个框被点中时读取你按下的一次组合键，不监听系统，也不需要额外权限。⌘Tab、⌘空格、⌃← / → 这类系统快捷键录不到，可以在下面选。")
+                Text("只在这个框被点中时读取你按下的一次组合键，不监听系统，也不需要额外权限。只按 Fn 或修饰键（比如 Fn + 左 Shift）也能录，全部松开时记下。⌘Tab、⌘空格、⌃← / → 这类系统快捷键录不到，可以在下面选。")
                     .font(.system(size: 12))
                     .foregroundStyle(.tertiary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -633,6 +673,7 @@ struct ComboEditor: View {
             }
             HStack(spacing: 6) {
                 caption("自定义").padding(.trailing, 6)
+                modifier("Fn", "Fn（地球仪键）", $combo.fn)
                 modifier("⌃", "Control", $combo.control)
                 modifier("⌥", "Option", $combo.option)
                 modifier("⇧", "Shift", $combo.shift)

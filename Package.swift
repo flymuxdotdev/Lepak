@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "vibe-key",
+    name: "lepak",
     platforms: [.macOS(.v14)],
     targets: [
         .target(
-            name: "VibeKeyKit",
+            name: "LepakKit",
             linkerSettings: [.linkedFramework("IOKit")]
         ),
         .executableTarget(name: "probe"),
         .executableTarget(
             name: "menubar",
-            dependencies: ["VibeKeyKit"],
+            dependencies: ["LepakKit"],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("ApplicationServices"),

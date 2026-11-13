@@ -16,27 +16,49 @@ private struct KnobPress {
     var cooldownUntil: DispatchTime?
 }
 
+/// 开了长按或双击的语音 / 确定 / 取消键：一轮按键（双击就是两下）的状态。按下时先不发，等判断出是哪种再发。
+private struct GesturePress {
+    let serial: Int
+    let key: GestureKey
+    /// 按下第一下时的设置，这一轮都照它判断（中途改了设置也不会乱）。
+    let single: KeyCombo
+    let long: KeyCombo?
+    let double: KeyCombo?
+    /// 第几下（1 或 2）。
+    var clicks = 1
+    var isDown = true
+    /// 这一轮已经发过长按或双击，后面的松开什么都不发。
+    var done = false
+}
+
 private final class DeviceKeyState: @unchecked Sendable {
     let lock = NSLock()
-    /// 确定 / 取消：物理键 → 这次按下发出的键、修饰键和编号。松开时照这个松开（按住期间改了设置也不会松错键），
+    /// 没开长按 / 双击的键：物理键 → 这次按下发出的组合和编号。松开时照这个松开（按住期间改了设置也不会松错键），
     /// 编号用来作废旧的兜底松开任务。
-    var held: [Int: (code: CGKeyCode, flags: CGEventFlags, generation: Int)] = [:]
+    var held: [Int: (combo: KeyCombo, generation: Int)] = [:]
     var generation = 0
-    let queue = DispatchQueue(label: "local.vibe-key.keys")
+    /// 语音键这次按下是不是直接交给了 `FunctionKey`（默认的 Fn、没开长按 / 双击），松开时也要交给它。
+    var voiceUsesFunctionKey = false
+    let queue = DispatchQueue(label: "local.lepak.keys")
     let source = CGEventSource(stateID: .hidSystemState)
     // 以下只在 queue 上读写：旋钮的按下、转动、松开都排在同一个串行队列里，保证先后顺序。
     var knobPress: KnobPress?
     var knobPressSerial = 0
+    /// 开了长按 / 双击的键：物理键 → 正在进行的这一轮。
+    var gestures: [Int: GesturePress] = [:]
+    var gestureSerial = 0
     /// 普通转动：上一格的时间和这一轮的判断结果（true = 移动光标）。
     var lastKnobTick: DispatchTime?
     var knobMovesCaret = false
 }
 
-/// 确定、取消和旋钮。具体发什么键、旋钮怎么转都从 `Config.current` 读，设置里改了立即生效。
+/// 语音键、确定、取消和旋钮。具体发什么键、旋钮怎么转都从 `Config.current` 读，设置里改了立即生效。
 ///
 /// 本程序每秒发心跳时，AU05 认为有配套程序，就不再自己发键盘键，只通过配置口报告，
 /// 所以要由本程序代发。默认值按官方 Ulanzi Studio 的默认预设：
-/// - 确定 → Return，取消 → Esc。
+/// - 语音键 → Fn，交给 `FunctionKey`（按下就按下 Fn、松开就松开，按住时长有上下限）。
+/// - 确定 → Return，取消 → Esc。按下立刻发 keyDown，松开发 keyUp。
+/// - 这三个键在设置里开了长按或双击，才改成判断手势（见 `gesturePress`），没开的键不受影响。
 /// - 旋钮转动：在输入框里（有焦点且鼠标停在上面）移动光标；其他地方滚动，每格 3 行。
 ///   每一轮连续转动只在第一格判断一次（见 `TextFocus`），后面的格子沿用结果。
 /// - 旋钮按下：按下时什么都不发，松开时才决定——
@@ -60,6 +82,8 @@ enum DeviceKeys {
     }
 
     static func report(_ control: MappingControl, _ title: String, _ combo: KeyCombo?) {
+        // 转动只在开了「输入框里移动光标」时才报告，所以转动次数在 knobTick 里单独记。
+        if control != .knobTurn { Usage.shared.add(control) }
         reporter.lock.lock()
         let handler = reporter.handler
         reporter.lock.unlock()
@@ -67,8 +91,8 @@ enum DeviceKeys {
     }
 
     private enum Action {
-        /// 按下就按下，松开就松开。
-        case key(KeyCombo, name: String)
+        /// 语音 / 确定 / 取消：没开长按、双击时按下就按下，松开就松开。
+        case key(GestureKey)
         /// 旋钮按下（物理 3）。
         case knobPress
         /// 旋钮一格。arrow 是这个方向对应的方向键：光标移动和切换桌面都用它。
@@ -80,9 +104,8 @@ enum DeviceKeys {
         // 滚动方向用户已确认；光标方向实测要和滚动反过来：滚轮向上那一侧对应光标右移。
         let lines = Int32(config.scrollLines) * (config.reverseScroll ? -1 : 1)
         let (rightArrow, leftArrow): (CGKeyCode, CGKeyCode) = config.reverseCaret ? (123, 124) : (124, 123)
+        if let key = GestureKey(physicalIndex: physicalIndex) { return .key(key) }
         switch physicalIndex {
-        case 1: return .key(config.confirm, name: "确定")
-        case 2: return .key(config.cancel, name: "取消")
         case 3: return .knobPress
         case 4: return .knob(lines: lines, arrow: rightArrow, name: "左转")    // 默认：光标右移 / 滚轮向上 / 切到右边的桌面
         case 5: return .knob(lines: -lines, arrow: leftArrow, name: "右转")   // 默认：光标左移 / 滚轮向下 / 切到左边的桌面
@@ -122,15 +145,48 @@ enum DeviceKeys {
             default:
                 return nil
             }
-        case let .key(combo, name):
+        case let .key(key):
+            let name = key.name
             switch status {
             case 1:
-                guard !combo.isNone else { return "\(name)：设为不发送" }
-                press(physicalIndex, combo)
-                report(physicalIndex == 1 ? .confirm : .cancel, combo.label ?? name, combo)
-                return "已按下 \(name)（\(combo.title)）"
+                let config = Config.current
+                let single = config[keyPath: key.singlePath]
+                let long = config[keyPath: key.gesturePath(.long)]
+                let double = config[keyPath: key.gesturePath(.double)]
+                if long != nil || double != nil {
+                    let press = GesturePress(serial: 0, key: key, single: single, long: long, double: double)
+                    let seconds = config.longPressSeconds
+                    state.queue.async { gesturePress(physicalIndex, press, longSeconds: seconds) }
+                    return "\(name)按下（开了\(long != nil ? "长按" : "")\(long != nil && double != nil ? "、" : "")\(double != nil ? "双击" : "")，等判断）"
+                }
+                guard !single.isNone else { return "\(name)：设为不发送" }
+                if key == .voice, single == .fnKey {
+                    // 语音键默认：和以前一样直接交给 FunctionKey。
+                    state.queue.async { flushPendingClicks(except: physicalIndex) }
+                    guard FunctionKey.handle(pressed: true) else { return "Fn 未发出" }
+                    state.lock.lock()
+                    state.voiceUsesFunctionKey = true
+                    state.lock.unlock()
+                    report(.voice, single.label ?? "语音输入", single)
+                    return "已按下 Fn"
+                }
+                press(physicalIndex, single)
+                report(key.control, single.label ?? name, single)
+                return "已按下 \(name)（\(single.title)）"
             case 0:
-                return release(physicalIndex, generation: nil) ? "已松开 \(name)" : nil
+                if key == .voice {
+                    state.lock.lock()
+                    let usesFunctionKey = state.voiceUsesFunctionKey
+                    state.voiceUsesFunctionKey = false
+                    state.lock.unlock()
+                    if usesFunctionKey {
+                        _ = FunctionKey.handle(pressed: false)
+                        return nil
+                    }
+                }
+                if release(physicalIndex, generation: nil) { return "已松开 \(name)" }
+                state.queue.async { gestureRelease(physicalIndex) }
+                return nil
             default:
                 return nil
             }
@@ -143,30 +199,33 @@ enum DeviceKeys {
         let keys = Array(state.held.values)
         state.held.removeAll()
         state.generation &+= 1
+        state.voiceUsesFunctionKey = false   // Fn 本身由调用方 FunctionKey.reset() 松开
         state.lock.unlock()
         state.queue.async {
             state.knobPress = nil
+            state.gestures.removeAll()
             for key in keys {
-                postKey(key.code, down: false, flags: key.flags)
+                comboUp(key.combo)
             }
         }
     }
 
-    // MARK: 确定 / 取消
+    // MARK: 没开长按 / 双击的语音 / 确定 / 取消
 
     private static func press(_ physical: Int, _ combo: KeyCombo) {
         state.lock.lock()
         let previous = state.held[physical]
         state.generation &+= 1
         let generation = state.generation
-        state.held[physical] = (combo.keyCode, combo.flags, generation)
+        state.held[physical] = (combo, generation)
         state.lock.unlock()
         state.queue.async {
+            flushPendingClicks(except: physical)
             if let previous {
                 // 上一次的松开包丢了，先补一个松开。
-                postKey(previous.code, down: false, flags: previous.flags)
+                comboUp(previous.combo)
             }
-            postKey(combo.keyCode, down: true, flags: combo.flags)
+            comboDown(combo)
         }
         state.queue.asyncAfter(deadline: .now() + maxHold) {
             _ = release(physical, generation: generation)
@@ -184,14 +243,105 @@ enum DeviceKeys {
         state.lock.unlock()
         guard matches, let current else { return false }
         state.queue.async {
-            postKey(current.code, down: false, flags: current.flags)
+            comboUp(current.combo)
         }
         return true
+    }
+
+    // MARK: 长按 / 双击（只在 state.queue 上调用）
+    //
+    // 只开了长按：按下先不发；按住到时长发长按，没到就松手，松手时发单击。
+    // 开了双击：松手后等 `doubleClickWindow`，没有第二下才发单击；第二下一按下就发双击。
+    // 两个都开：先看长按，没到时长就松手的再看双击。
+    // 单击、长按、双击都是「按一下就松开」地发出去（不再跟着手按住）。
+
+    private static func gesturePress(_ physical: Int, _ initial: GesturePress, longSeconds: Double) {
+        flushPendingClicks(except: physical)
+        if var round = state.gestures[physical] {
+            if !round.isDown, !round.done, round.clicks == 1, let double = round.double {
+                // 等第二下的时候按下了：双击。
+                round.clicks = 2
+                round.isDown = true
+                round.done = true
+                state.gestures[physical] = round
+                send(double, round, .double)
+                return
+            }
+            // 上一轮的松开包丢了：作废上一轮，重新开始。
+            DebugLog.write("\(round.key.name)：上一轮没收到松开，已作废")
+        }
+        state.gestureSerial &+= 1
+        let serial = state.gestureSerial
+        let round = GesturePress(serial: serial, key: initial.key,
+                                 single: initial.single, long: initial.long, double: initial.double)
+        state.gestures[physical] = round
+        if round.long != nil {
+            state.queue.asyncAfter(deadline: .now() + longSeconds) {
+                guard var round = state.gestures[physical], round.serial == serial,
+                      round.isDown, round.clicks == 1, !round.done, let long = round.long
+                else { return }
+                round.done = true
+                state.gestures[physical] = round
+                send(long, round, .long)
+            }
+        }
+        state.queue.asyncAfter(deadline: .now() + maxHold) {
+            guard let round = state.gestures[physical], round.serial == serial, round.isDown else { return }
+            state.gestures[physical] = nil
+            DebugLog.write("\(round.key.name)按住超过 \(Int(maxHold)) 秒没收到松开，已作废")
+        }
+    }
+
+    private static func gestureRelease(_ physical: Int) {
+        guard var round = state.gestures[physical], round.isDown else { return }
+        round.isDown = false
+        if round.done {
+            state.gestures[physical] = nil
+            return
+        }
+        guard round.double != nil else {
+            // 只开了长按，没到时长就松手：单击。
+            state.gestures[physical] = nil
+            send(round.single, round, nil)
+            return
+        }
+        state.gestures[physical] = round
+        let serial = round.serial
+        state.queue.asyncAfter(deadline: .now() + doubleClickWindow) {
+            guard let round = state.gestures[physical], round.serial == serial,
+                  !round.isDown, !round.done, round.clicks == 1
+            else { return }
+            state.gestures[physical] = nil
+            send(round.single, round, nil)
+        }
+    }
+
+    /// 另一个键或旋钮动了：还在等第二下的键马上按单击发出去，免得发出去的顺序和按的顺序反了。
+    private static func flushPendingClicks(except physical: Int?) {
+        for (key, round) in state.gestures where key != physical && !round.isDown && !round.done {
+            state.gestures[key] = nil
+            send(round.single, round, nil)
+        }
+    }
+
+    /// gesture 为 nil 表示单击。
+    private static func send(_ combo: KeyCombo, _ round: GesturePress, _ gesture: KeyGesture?) {
+        let kind = gesture?.title ?? "单击"
+        let name = round.key.name
+        if combo.isNone {
+            DebugLog.write("\(name)\(kind)：设为不发送")
+            return
+        }
+        tapCombo(combo)
+        let label = combo.label ?? (gesture == nil ? name : "自定义快捷键")
+        report(round.key.control, gesture.map { "\($0.title) · \(label)" } ?? label, combo)
+        DebugLog.write("\(name)\(kind)：已发 \(combo.title)")
     }
 
     // MARK: 旋钮按下（只在 state.queue 上调用）
 
     private static func beginKnobPress() {
+        flushPendingClicks(except: nil)
         state.knobPressSerial &+= 1
         let serial = state.knobPressSerial
         state.knobPress = KnobPress(serial: serial, pressedAt: .now())
@@ -217,7 +367,7 @@ enum DeviceKeys {
         let isLong = held >= config.longPressSeconds
         let combo = isLong ? config.knobLongPress : config.knobShortPress
         if !combo.isNone {
-            tap(combo.keyCode, flags: combo.flags)
+            tapCombo(combo)
             report(.knobPress, combo.label ?? (isLong ? "长按" : "短按"), combo)
         }
         DebugLog.write(String(format: "旋钮松开：%@ %.2f 秒，%@", isLong ? "长按" : "短按", held,
@@ -227,6 +377,7 @@ enum DeviceKeys {
     // MARK: 旋钮转动（只在 state.queue 上调用）
 
     private static func knobTick(lines: Int32, arrow: CGKeyCode) {
+        flushPendingClicks(except: nil)
         let now = DispatchTime.now()
         let config = Config.current
         if config.switchSpacesWhilePressed, var press = state.knobPress {
@@ -236,6 +387,7 @@ enum DeviceKeys {
         }
         let sameBurst = state.lastKnobTick.map { now.uptimeNanoseconds - $0.uptimeNanoseconds < knobBurstGap } ?? false
         if !sameBurst {
+            Usage.shared.add(.knobTurn)   // 一轮连续转动记一次
             if config.caretInTextFields {
                 let decision = TextFocus.decide()
                 state.knobMovesCaret = decision.moveCaret
@@ -283,6 +435,70 @@ enum DeviceKeys {
     private static func tap(_ code: CGKeyCode, flags: CGEventFlags) {
         postKey(code, down: true, flags: flags)
         postKey(code, down: false, flags: flags)
+    }
+
+    /// 只有修饰键的组合（比如 Fn + 左 Shift）按住多久再松开。Typeless 这类软件隔一会儿才看一次
+    /// 「现在按住了哪些修饰键」，按得太短它看不到；也不能太长（超过 0.6 秒 Typeless 会当成按住不放）。
+    private static let modifierHold: TimeInterval = 0.15
+
+    /// 点一下一个组合（长按 / 双击 / 单击判断出来之后、旋钮按下松开时用）。只在 state.queue 上调用。
+    private static func tapCombo(_ combo: KeyCombo) {
+        if combo == .fnKey {
+            // 只按 Fn：和语音键一样交给 FunctionKey，按住 0.12 秒再松开，Typeless 才认得出来。
+            FunctionKey.tap()
+            return
+        }
+        comboDown(combo)
+        if combo.isModifierOnly {
+            state.queue.asyncAfter(deadline: .now() + modifierHold) { comboUp(combo) }
+        } else {
+            comboUp(combo)
+        }
+    }
+
+    /// 按下一个组合。普通组合（没有 Fn、主键也不是修饰键）和以前一样：只发主键，带上修饰键标志。
+    /// 有 Fn 或主键是修饰键的，照真键盘的样子一个个按下：Fn → ⌃ → ⌥ → ⇧ → ⌘ → 主键。
+    private static func comboDown(_ combo: KeyCombo) {
+        guard combo.needsKeySequence else {
+            postKey(combo.keyCode, down: true, flags: combo.flags)
+            return
+        }
+        var flags: CGEventFlags = []
+        for key in modifierSequence(combo) {
+            flags.formUnion(key.flags)
+            postKey(key.code, down: true, flags: flags)
+        }
+        if ModifierKey.all[combo.keyCode] == nil {
+            postKey(combo.keyCode, down: true, flags: flags)
+        }
+    }
+
+    /// 松开一个组合：倒过来一个个松开，每松开一个，标志里就去掉它（Typeless 靠标志判断松开了没有）。
+    private static func comboUp(_ combo: KeyCombo) {
+        guard combo.needsKeySequence else {
+            postKey(combo.keyCode, down: false, flags: combo.flags)
+            return
+        }
+        var remaining = modifierSequence(combo)
+        func held() -> CGEventFlags { remaining.reduce(CGEventFlags()) { $0.union($1.flags) } }
+        if ModifierKey.all[combo.keyCode] == nil {
+            postKey(combo.keyCode, down: false, flags: held())
+        }
+        while let key = remaining.popLast() {
+            postKey(key.code, down: false, flags: held())
+        }
+    }
+
+    /// 要一个个按下的修饰键和它们的标志，按按下的顺序：Fn、⌃、⌥、⇧、⌘（都按左边那个），最后是当主键的修饰键。
+    private static func modifierSequence(_ combo: KeyCombo) -> [(code: CGKeyCode, flags: CGEventFlags)] {
+        var codes: [UInt16] = []
+        if combo.fn { codes.append(ModifierKey.fn) }
+        if combo.control { codes.append(59) }
+        if combo.option { codes.append(58) }
+        if combo.shift { codes.append(56) }
+        if combo.command { codes.append(55) }
+        if ModifierKey.all[combo.keyCode] != nil, !codes.contains(combo.keyCode) { codes.append(combo.keyCode) }
+        return codes.compactMap { code in ModifierKey.all[code].map { (CGKeyCode(code), $0) } }
     }
 
     /// 修饰键必须显式给出。新事件默认继承系统记录的修饰键状态，Typeless 用 Command+V

@@ -5,11 +5,18 @@ import SwiftUI
 // 深色画布 + 点阵底纹、左侧圆角侧栏、不带阴影的大圆角卡片、描边键帽、大号粗体标题。
 // 浅色模式用同一套结构换成浅色。全部用 SwiftUI 画，真实窗口和开发用的离屏截图一样。
 
+/// 整个窗口的强调色（开关、按钮、首页统计、「已发送」提示）：固定的暖橙红，不跟设备主题走——
+/// 接了好几台设备时，也说不清该听哪台的。设备主题的颜色只用在那台设备自己的页面里。
+enum Brand {
+    static let accent = Color(red: 0.93, green: 0.42, blue: 0.25)
+}
+
 extension DeviceTheme {
-    /// 强调色：标准版暖橙红（和 App 图标一致），WorkBuddy 版冷青。只用在徽标、主按钮、开关和选中状态上。
+    /// 设备主题的强调色：标准版和窗口一样是暖橙红，WorkBuddy 版冷青。
+    /// 只用在这台设备的页面上（按键展台、设备信息、选中状态），窗口其他地方用 `Brand.accent`。
     var accent: Color {
         switch self {
-        case .standard: return Color(red: 0.93, green: 0.42, blue: 0.25)
+        case .standard: return Brand.accent
         case .workBuddy: return Color(red: 0.20, green: 0.74, blue: 0.62)
         }
     }

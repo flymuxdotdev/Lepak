@@ -8,7 +8,7 @@ private final class FunctionKeyState: @unchecked Sendable {
     var downAt = DispatchTime.now()
     /// 每次按下或重置都加一，用来作废已经排好的旧松开任务。
     var generation = 0
-    let poster = DispatchQueue(label: "local.vibe-key.fn")
+    let poster = DispatchQueue(label: "local.lepak.fn")
     let source: CGEventSource?
 
     init() {
@@ -86,6 +86,12 @@ enum FunctionKey {
             release(generation)
         }
         return true
+    }
+
+    /// 点一下 Fn：按下，按住 `minHold` 再松开。语音键开了长按 / 双击、或者别的键设成 Fn 时用。
+    static func tap() {
+        guard handle(pressed: true) else { return }
+        _ = handle(pressed: false)
     }
 
     private static func release(_ generation: Int) {

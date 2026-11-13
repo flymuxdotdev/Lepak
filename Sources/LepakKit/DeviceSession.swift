@@ -65,7 +65,7 @@ public final class DeviceSession: @unchecked Sendable {
             ready.signal()
             CFRunLoopRun()
         }
-        thread.name = "Vibe Key HID"
+        thread.name = "Lepak HID"
         thread.start()
         ready.wait()
     }

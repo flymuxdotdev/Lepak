@@ -1,33 +1,60 @@
 import AppKit
 import ApplicationServices
+import AuthenticationServices
 import ServiceManagement
 import SwiftUI
-import VibeKeyKit
+import LepakKit
 
-/// 设置窗口的几页。首页 / 按键 / 设备在左侧栏的导航里；「设置」（启动、权限、外观）是侧栏底部的齿轮。
-enum SettingsSection: String, CaseIterable, Identifiable {
-    case home, keys, device, general
+/// Lepak 支持的硬件型号。现在只有 AU05；以后加遥控器等别的设备，在这里加一项，侧栏「我的设备」就会多一行。
+/// 几台设备可以同时连着、同时工作，没有「当前设备」这回事；侧栏点哪台，只是在看哪台的设置。
+enum DeviceKind: String, CaseIterable, Identifiable {
+    case au05
 
     var id: String { rawValue }
 
-    /// 侧栏导航里列出的几页。
-    static let navigation: [SettingsSection] = [.home, .keys, .device]
-
-    var title: String {
+    var name: String {
         switch self {
-        case .home: return "首页"
-        case .keys: return "按键"
-        case .device: return "设备"
-        case .general: return "设置"
+        case .au05: return "Ulanzi AU05"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .home: return "house"
-        case .keys: return "keyboard"
-        case .device: return "dot.radiowaves.left.and.right"
-        case .general: return "gearshape"
+        case .au05: return "mic.and.signal.meter"
+        }
+    }
+
+    /// 使用次数里记的设备名（见 `Usage`）。
+    var usageName: String {
+        switch self {
+        case .au05: return Usage.au05
+        }
+    }
+
+    init?(usageName: String) {
+        guard let kind = Self.allCases.first(where: { $0.usageName == usageName }) else { return nil }
+        self = kind
+    }
+}
+
+/// 设置窗口的几页。侧栏：首页、「我的设备」下每台设备一页、添加设备；「设置」（启动、权限、关于）是侧栏底部的齿轮。
+enum SettingsSection: Hashable, Identifiable {
+    case home
+    case device(DeviceKind)
+    case addDevice
+    case general
+
+    static let allCases: [SettingsSection] = [.home] + DeviceKind.allCases.map { .device($0) } + [.addDevice, .general]
+
+    var id: String { name }
+
+    /// 英文短名，开发截图的文件名用。
+    var name: String {
+        switch self {
+        case .home: return "home"
+        case .device(let kind): return "device-\(kind.rawValue)"
+        case .addDevice: return "add-device"
+        case .general: return "general"
         }
     }
 }
@@ -61,10 +88,19 @@ final class SettingsModel: ObservableObject {
         }
     }
     @Published var section: SettingsSection = .home
+    /// 设置窗口是否全屏。全屏时没有红黄绿按钮，侧栏顶上不用再给它们留位置。
+    @Published var isFullScreen = false
+    /// 用 Apple 登录的账号（见 `AppleAccount`）；nil 是没登录。侧栏底部按它显示头像、邮箱和状态。
+    @Published var account: Account?
+    /// 登录失败时显示在「设置 → 账号」里的话。
+    @Published private(set) var accountMessage: String?
+    private var revokedObserver: NSObjectProtocol?
     /// 最近几次操作（最新的在前）。
     @Published private(set) var recentActions: [DeviceAction] = []
     /// 本次启动以来 AU05 触发过几次操作。
     @Published private(set) var actionCount = 0
+    /// 首页「洞察」：历史使用次数，按天、按设备加总。
+    @Published var usage = Usage.summarize(Usage.shared.snapshot)
     /// 刚触发的那一次：卡片和按键闪一下，并弹出「已发送」提示，2 秒后消失。
     @Published private(set) var flash: DeviceAction?
     /// 按键映射页的选中和编辑状态。
@@ -78,8 +114,53 @@ final class SettingsModel: ObservableObject {
 
     init() {
         config = Config.current
+        account = AppleAccount.load()
         refreshUlanzi()
         refreshLoginItem()
+        // 用户在系统设置里撤销了 Lepak 的 Apple 登录：本机也登出。
+        revokedObserver = NotificationCenter.default.addObserver(
+            forName: ASAuthorizationAppleIDProvider.credentialRevokedNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.signOut() }
+        }
+        refreshAccount()
+    }
+
+    // MARK: 账号
+
+    /// 「用 Apple 登录」按钮的结果。
+    func completeSignIn(_ result: Result<ASAuthorization, Error>) {
+        switch result {
+        case .success(let authorization):
+            guard let signedIn = AppleAccount.account(from: authorization, previous: account) else {
+                accountMessage = "登录没有成功：Apple 没有返回账号信息。"
+                return
+            }
+            account = signedIn
+            AppleAccount.save(signedIn)
+            accountMessage = nil
+        case .failure(let error):
+            accountMessage = AppleAccount.message(for: error)
+        }
+    }
+
+    /// 只是让本机忘掉这个账号；要彻底取消授权，用户得去「系统设置 → Apple 账户 → 用 Apple 登录」。
+    func signOut() {
+        account = nil
+        AppleAccount.save(nil)
+        accountMessage = nil
+    }
+
+    /// 打开设置窗口时问一下 Apple，授权是不是被撤销了。
+    func refreshAccount() {
+        guard let id = account?.appleUserID else { return }
+        AppleAccount.checkRevoked(id) { [weak self] revoked in
+            guard revoked else { return }
+            Task { @MainActor in
+                guard let self, self.account?.appleUserID == id else { return }
+                self.signOut()
+            }
+        }
     }
 
     var theme: DeviceTheme { config.deviceTheme }
@@ -102,10 +183,22 @@ final class SettingsModel: ObservableObject {
         }
     }
 
-    /// 跳到按键页，选中某个控件。
+    /// 跳到 AU05 的页面，选中某个控件。
     func open(_ control: MappingControl) {
         mappingUI.select(control)
-        section = .keys
+        section = .device(.au05)
+    }
+
+    /// 开发截图用：假装 Ulanzi Studio 正在运行，看提醒条放不放得下。
+    func showSampleUlanziWarning(_ running: Bool) {
+        ulanziRunning = running
+    }
+
+    /// 某台设备的连接和电量。现在只接了 AU05；以后每种设备各自上报。
+    func snapshot(of kind: DeviceKind) -> DeviceSnapshot {
+        switch kind {
+        case .au05: return device
+        }
     }
 
     var versionText: String {
@@ -148,7 +241,7 @@ final class SettingsModel: ObservableObject {
         let status = SMAppService.mainApp.status
         launchAtLogin = status == .enabled
         loginItemMessage = status == .requiresApproval
-            ? "还需要在「系统设置 → 通用 → 登录项与扩展」里允许 Vibe Key。"
+            ? "还需要在「系统设置 → 通用 → 登录项与扩展」里允许 Lepak。"
             : nil
     }
 

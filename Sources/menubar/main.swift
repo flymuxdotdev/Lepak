@@ -1,7 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
-import VibeKeyKit
+import LepakKit
 
 @MainActor
 final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -24,19 +24,12 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let logURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/VibeKey.log")
+            .appendingPathComponent("Library/Logs/Lepak.log")
         try? Data().write(to: logURL)
         if let button = statusItem.button {
-            // 菜单栏图标：模板图，系统会按浅色/深色菜单栏自动着色。打包时从 Support 复制进 Resources。
-            if let icon = NSImage(named: "MenuBarIcon") {
-                icon.isTemplate = true
-                // 键帽 + 麦克风。16pt 和菜单栏里其他图标（13–17pt）一样大。
-                icon.size = NSSize(width: 16, height: 16)
-                button.image = icon
-                button.imagePosition = .imageLeading
-            } else {
-                button.title = "AU05"
-            }
+            // 菜单栏图标：六根竖条（BrandIcon），13pt 高、比侧栏 Logo 细一点，模板图，系统按浅色 / 深色菜单栏自动着色。
+            button.image = BrandIcon.menuBarImage()
+            button.imagePosition = .imageLeading
         }
         let menu = NSMenu()
         menu.delegate = self
@@ -57,18 +50,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         session.onVendorKey = { [weak self] event in
-            let note: String?
-            if event.physicalIndex == 0 {
-                let sent = (event.status == 0 || event.status == 1)
-                    ? FunctionKey.handle(pressed: event.status == 1)
-                    : false
-                note = event.status == 1 ? (sent ? "已按下 Fn" : "Fn 未发出") : nil
-                if event.status == 1, sent {
-                    DeviceKeys.report(.voice, "语音输入", KeyCombo(keyCode: FunctionKey.virtualKey))
-                }
-            } else {
-                note = DeviceKeys.handle(physicalIndex: event.physicalIndex, status: event.status)
-            }
+            // 语音键（物理 0）也在 DeviceKeys 里：默认交给 FunctionKey，开了长按 / 双击时走手势判断。
+            let note = DeviceKeys.handle(physicalIndex: event.physicalIndex, status: event.status)
             Task { @MainActor in
                 var line = "配置口按键 序号 \(event.index) 状态 \(event.status) 物理 \(event.physicalIndex)"
                 if let note {
@@ -92,6 +75,11 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DeviceKeys.setActionHandler { [weak self] control, title, combo in
             Task { @MainActor in
                 self?.settings.record(control, title, combo)
+            }
+        }
+        Usage.shared.onChange { [weak self] data in
+            Task { @MainActor in
+                self?.settings.usage = Usage.summarize(data)
             }
         }
         FunctionKey.requestTrust()
@@ -160,37 +148,30 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 Task { @MainActor in
                     guard let self else { return }
                     self.settings.refreshUlanzi()
-                    self.log(self.settings.ulanziRunning ? "Ulanzi Studio 已启动，可能和 Vibe Key 抢 AU05" : "Ulanzi Studio 已退出")
+                    self.log(self.settings.ulanziRunning ? "Ulanzi Studio 已启动，可能和 Lepak 抢 AU05" : "Ulanzi Studio 已退出")
                 }
             })
         }
         if settings.ulanziRunning {
-            log("Ulanzi Studio 正在运行，可能和 Vibe Key 抢 AU05")
+            log("Ulanzi Studio 正在运行，可能和 Lepak 抢 AU05")
         }
     }
 
-    /// 有图标时菜单栏只显示图标（电量在菜单里看），没连上时图标变灰；
-    /// 没有图标（不是从打包的 App 启动）时才用文字顶替。
-    private func setStatusTitle(_ text: String, connected: Bool) {
-        guard let button = statusItem.button else { return }
-        if button.image == nil {
-            button.title = "AU05 \(text)"
-        } else {
-            button.title = ""
-            button.appearsDisabled = !connected
-        }
+    /// 菜单栏只显示图标（电量在菜单里看），没连上时图标变灰。
+    private func setConnected(_ connected: Bool) {
+        statusItem.button?.appearsDisabled = !connected
     }
 
     private func show(_ status: PowerStatus?) {
         if let status {
-            setStatusTitle(status.charging ? "\(status.percent)% 充电" : "\(status.percent)%", connected: true)
+            setConnected(true)
             if loggedPercent != status.percent || loggedCharging != status.charging {
                 loggedPercent = status.percent
                 loggedCharging = status.charging
                 log("状态 \(status.percent)% \(status.millivolts) mV \(status.charging ? "充电" : "未充电")")
             }
         } else {
-            setStatusTitle("未连接", connected: false)
+            setConnected(false)
             if loggedPercent != nil || loggedCharging != nil {
                 loggedPercent = nil
                 loggedCharging = nil
@@ -234,7 +215,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let debug = menu.addItem(withTitle: "调试", action: nil, keyEquivalent: "")
         debug.submenu = debugMenu
         menu.addItem(.separator())
-        let quit = menu.addItem(withTitle: "退出 Vibe Key", action: #selector(quit), keyEquivalent: "q")
+        let quit = menu.addItem(withTitle: "退出 Lepak", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
     }
 
@@ -247,7 +228,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openDevicePage() {
-        settingsWindow.show(section: .device)
+        // Ulanzi Studio 冲突的提醒条在 AU05 页面顶上。
+        settingsWindow.show(section: .device(.au05))
     }
 
     private func log(_ line: String) {
@@ -261,6 +243,7 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         FunctionKey.reset()
+        Usage.shared.flush()
     }
 
     @objc private func quit() {
