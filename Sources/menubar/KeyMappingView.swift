@@ -11,8 +11,11 @@ enum Hotspot: Hashable {
 /// 一个外观主题的 AU05 图和图上各按键的位置。位置是 0–1 的比例，左上角为原点，按 Support 里的图量出来；
 /// 打包时没有这张图（比如直接 swift run）就用代码画的简图，位置和真图对齐。
 struct DeviceArt: Sendable {
+    enum Sketch: Sendable { case au05, passport }
     /// Resources 里的图片名。
     let imageName: String
+    /// 没有图片时画哪种简图。
+    var sketch = Sketch.au05
     /// 宽 / 高。
     let aspect: CGFloat
     let centers: [Hotspot: CGPoint]
@@ -47,11 +50,38 @@ struct DeviceArt: Sendable {
         radii: [.knob: 0.37, .mic: 0.28, .check: 0.28, .cancel: 0.28]
     )
 
+    /// AI Passport：没有实拍图，用代码画（`PassportSketch`）。竖着的卡片，上面是屏幕，屏幕右边从上到下是上键、OK、下键。
+    static let passport = DeviceArt(
+        imageName: "PassportArt",
+        sketch: .passport,
+        aspect: 0.64,
+        centers: [
+            .check: CGPoint(x: 0.885, y: 0.200),
+            .mic: CGPoint(x: 0.885, y: 0.335),
+            .cancel: CGPoint(x: 0.885, y: 0.470),
+        ],
+        radii: [.check: 0.085, .mic: 0.085, .cancel: 0.085]
+    )
+
     static func of(_ theme: DeviceTheme) -> DeviceArt {
         switch theme {
         case .standard: return .standard
         case .workBuddy: return .workBuddy
         }
+    }
+
+    /// 某台设备在设置里用的图。AU05 跟着款式走。
+    static func of(_ kind: DeviceKind, theme: DeviceTheme) -> DeviceArt {
+        switch kind {
+        case .au05: return of(theme)
+        case .passport: return .passport
+        }
+    }
+
+    /// 图上能点的位置，按从上到下的顺序。
+    var spots: [Hotspot] {
+        [Hotspot.knob, .check, .mic, .cancel].filter { centers[$0] != nil }
+            .sorted { centers[$0]!.y < centers[$1]!.y }
     }
 }
 
@@ -71,11 +101,13 @@ struct DeviceArtView: View {
                         .resizable()
                         .interpolation(.high)
                         .frame(width: size.width, height: size.height)
+                } else if art.sketch == .passport {
+                    PassportSketch(size: size)
                 } else {
                     SketchDevice(art: art, size: size)
                 }
                 if let onTap {
-                    ForEach([Hotspot.knob, .mic, .check, .cancel], id: \.self) { spot in
+                    ForEach(art.spots, id: \.self) { spot in
                         let center = art.centers[spot]!
                         let radius = (art.radii[spot] ?? 0.3) * size.width
                         Circle()
@@ -94,12 +126,68 @@ struct DeviceArtView: View {
     }
 
     private func spotName(_ spot: Hotspot) -> String {
+        let passport = art.sketch == .passport
         switch spot {
         case .knob: return "旋钮"
-        case .mic: return "语音键"
-        case .check: return "确定键"
-        case .cancel: return "取消键"
+        case .mic: return passport ? "OK 键" : "语音键"
+        case .check: return passport ? "上键" : "确定键"
+        case .cancel: return passport ? "下键" : "取消键"
         }
+    }
+}
+
+/// AI Passport 的简图：深色机身，上面一块竖屏，屏幕右边三个圆键（上、OK、下），下半截是喇叭孔。
+/// 键的位置和 `DeviceArt.passport` 对齐。
+private struct PassportSketch: View {
+    let size: CGSize
+
+    var body: some View {
+        let w = size.width
+        let h = size.height
+        let art = DeviceArt.passport
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: w * 0.10, style: .continuous)
+                .fill(LinearGradient(colors: [Color(white: 0.26), Color(white: 0.14)], startPoint: .top, endPoint: .bottom))
+                .overlay(RoundedRectangle(cornerRadius: w * 0.10, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
+            // 屏幕：240×320 竖屏。
+            RoundedRectangle(cornerRadius: w * 0.03, style: .continuous)
+                .fill(Color(red: 0.04, green: 0.07, blue: 0.06))
+                .overlay(
+                    VStack(spacing: h * 0.012) {
+                        Text("READY").font(.system(size: w * 0.075, weight: .bold, design: .monospaced))
+                        Text("LEPAK").font(.system(size: w * 0.045, weight: .medium, design: .monospaced)).opacity(0.6)
+                    }
+                    .foregroundStyle(Color(red: 0.45, green: 0.95, blue: 0.6))
+                )
+                .overlay(RoundedRectangle(cornerRadius: w * 0.03, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+                .frame(width: w * 0.66, height: w * 0.66 * 4 / 3)
+                .position(x: w * 0.42, y: h * 0.335)
+            ForEach([Hotspot.check, .mic, .cancel], id: \.self) { spot in
+                let center = art.centers[spot]!
+                Circle()
+                    .fill(LinearGradient(colors: [Color(white: 0.42), Color(white: 0.24)], startPoint: .top, endPoint: .bottom))
+                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
+                    .overlay(Image(systemName: spot == .check ? "chevron.up" : spot == .cancel ? "chevron.down" : "circle.fill")
+                        .font(.system(size: w * (spot == .mic ? 0.035 : 0.05), weight: .bold))
+                        .foregroundStyle(Color(white: 0.75)))
+                    .frame(width: w * 0.11, height: w * 0.11)
+                    .position(x: center.x * w, y: center.y * h)
+            }
+            // 喇叭孔。
+            VStack(spacing: w * 0.035) {
+                ForEach(0..<4, id: \.self) { _ in
+                    HStack(spacing: w * 0.035) {
+                        ForEach(0..<7, id: \.self) { _ in
+                            Circle().fill(Color.black.opacity(0.55)).frame(width: w * 0.03, height: w * 0.03)
+                        }
+                    }
+                }
+            }
+            .position(x: w * 0.5, y: h * 0.80)
+        }
+        .frame(width: w, height: h)
     }
 }
 
@@ -173,8 +261,28 @@ enum MappingControl: String, CaseIterable, Identifiable {
         case .knobPress, .knobTurn, .knobPressTurn: return .knob
         }
     }
-    /// 按键页里卡片放在设备左边还是右边：三个键在左，旋钮在右。
-    var onLeft: Bool { [.voice, .confirm, .cancel].contains(self) }
+    /// 按键页里卡片放在设备左边还是右边：AU05 三个键在左，旋钮在右；AI Passport 的键在机身右边，卡片都在右边。
+    func onLeft(on device: DeviceKind) -> Bool {
+        switch device {
+        case .au05: return [.voice, .confirm, .cancel].contains(self)
+        case .passport: return false
+        }
+    }
+
+    /// 在某台设备上的名字（AI Passport 的键按样子叫：OK 键、上键、下键）。
+    func title(on device: DeviceKind) -> String {
+        GestureKey(control: self)?.title(on: device) ?? title
+    }
+
+    func systemImage(on device: DeviceKind) -> String {
+        guard device == .passport else { return systemImage }
+        switch self {
+        case .voice: return "circle.circle"
+        case .confirm: return "chevron.up"
+        case .cancel: return "chevron.down"
+        default: return systemImage
+        }
+    }
 }
 
 /// 弹出设置的目标：卡片里的每一行。
@@ -252,9 +360,12 @@ private struct AnchorsKey: PreferenceKey {
 struct KeysPage: View {
     @ObservedObject var model: SettingsModel
     @ObservedObject var ui: MappingUIState
+    let kind: DeviceKind
 
-    private var theme: DeviceTheme { model.theme }
-    private var art: DeviceArt { DeviceArt.of(theme) }
+    /// 配色：AU05 跟着它的款式；别的设备没有款式，用标准配色。
+    private var theme: DeviceTheme { kind == .au05 ? model.theme : .standard }
+    private var art: DeviceArt { DeviceArt.of(kind, theme: theme) }
+    private var flash: DeviceAction? { model.flash?.device == kind ? model.flash : nil }
 
     /// 展台的尺寸：设备图高度、两侧卡片宽度、卡片和设备之间的最小间距。
     private struct StageSize {
@@ -268,11 +379,11 @@ struct KeysPage: View {
 
     /// 选中的或刚刚触发的控件，卡片、引线和按键会亮起来。
     private func isLit(_ control: MappingControl) -> Bool {
-        ui.selected == control || model.flash?.control == control
+        ui.selected == control || flash?.control == control
     }
 
     private var litSpot: Hotspot? {
-        (model.flash?.control ?? ui.selected)?.hotspot
+        (flash?.control ?? ui.selected)?.hotspot
     }
 
     /// 设备页的按键展台（标题、款式切换和「恢复默认」在设备页顶上）。
@@ -297,9 +408,13 @@ struct KeysPage: View {
     private func stage(_ size: StageSize) -> some View {
         let artHeight = size.artHeight
         let glow = artHeight * 500 / 480
+        let left = kind.controls.filter { $0.onLeft(on: kind) }
         return HStack(alignment: .center, spacing: 0) {
-            column(MappingControl.allCases.filter(\.onLeft), width: size.cardWidth)
-            Spacer(minLength: size.gap)
+            // 卡片都在一边时（AI Passport）不留另一边的空列，设备和卡片一起居中。
+            if !left.isEmpty {
+                column(left, width: size.cardWidth)
+                Spacer(minLength: size.gap)
+            }
             ZStack {
                 Circle()
                     .fill(RadialGradient(colors: [theme.glow.opacity(0.34), theme.glow.opacity(0)],
@@ -308,7 +423,7 @@ struct KeysPage: View {
                     .allowsHitTesting(false)
                 DeviceArtView(art: art, accent: theme.accent, highlighted: litSpot) { spot in
                     if spot != ui.selected?.hotspot {
-                        ui.select(MappingControl.allCases.first { $0.hotspot == spot })
+                        ui.select(kind.controls.first { $0.hotspot == spot })
                     }
                 }
                 .frame(width: artHeight * art.aspect, height: artHeight)
@@ -316,8 +431,12 @@ struct KeysPage: View {
             }
             .frame(width: artHeight * art.aspect + 40, height: artHeight)
             .zIndex(-1)
-            Spacer(minLength: size.gap)
-            column(MappingControl.allCases.filter { !$0.onLeft }, width: size.cardWidth)
+            if left.isEmpty {
+                Color.clear.frame(width: size.gap * 2, height: 1)
+            } else {
+                Spacer(minLength: size.gap)
+            }
+            column(kind.controls.filter { !$0.onLeft(on: kind) }, width: size.cardWidth)
         }
         .frame(maxWidth: .infinity)
         .overlayPreferenceValue(AnchorsKey.self) { anchors in
@@ -345,12 +464,12 @@ struct KeysPage: View {
         let accent = theme.accent
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Image(systemName: control.systemImage)
+                Image(systemName: control.systemImage(on: kind))
                     .font(.system(size: 12, weight: .bold))
                     .foregroundStyle(lit ? accent : Color.primary.opacity(0.8))
                     .frame(width: 28, height: 28)
                     .background(Circle().fill(lit ? accent.opacity(0.15) : Palette.raised))
-                Text(control.title).font(.system(size: 15, weight: .semibold))
+                Text(control.title(on: kind)).font(.system(size: 15, weight: .semibold))
                 Spacer()
                 if let key = GestureKey(control: control) {
                     addGestureButtons(key)
@@ -371,10 +490,10 @@ struct KeysPage: View {
             if let key = GestureKey(control: control) {
                 VStack(spacing: 6) {
                     row("单击", target: .single(key), control: control) {
-                        comboLabel(c[keyPath: key.singlePath])
+                        comboLabel(c[keyPath: key.singlePath(kind)])
                     }
                     ForEach(KeyGesture.allCases) { gesture in
-                        if let combo = c[keyPath: key.gesturePath(gesture)] {
+                        if let combo = c[keyPath: key.gesturePath(gesture, kind)] {
                             row(gesture.title, target: .gesture(key, gesture), control: control) {
                                 comboLabel(combo)
                             }
@@ -411,7 +530,7 @@ struct KeysPage: View {
     @ViewBuilder private func addGestureButtons(_ key: GestureKey) -> some View {
         HStack(spacing: 4) {
             ForEach(KeyGesture.allCases) { gesture in
-                let path = key.gesturePath(gesture)
+                let path = key.gesturePath(gesture, kind)
                 if model.config[keyPath: path] == nil {
                     Button {
                         model.config[keyPath: path] = key.suggestedCombo(gesture)
@@ -473,7 +592,7 @@ struct KeysPage: View {
         .popover(isPresented: Binding(
             get: { target != nil && ui.editing == target },
             set: { if !$0 { ui.closeEditor() } }
-        ), arrowEdge: control.onLeft ? .leading : .trailing) {
+        ), arrowEdge: control.onLeft(on: kind) ? .leading : .trailing) {
             if let target { editor(for: target) }
         }
     }
@@ -484,8 +603,8 @@ struct KeysPage: View {
         let accent = theme.accent
         switch target {
         case let .single(key):
-            PopoverPanel(title: "\(key.title) · 单击") {
-                ComboEditor(combo: $model.config[dynamicMember: key.singlePath], ui: ui, accent: accent)
+            PopoverPanel(title: "\(key.title(on: kind)) · 单击") {
+                ComboEditor(combo: $model.config[dynamicMember: key.singlePath(kind)], ui: ui, accent: accent)
                 singleClickNote(key)
             }
         case let .gesture(key, gesture):
@@ -545,12 +664,13 @@ struct KeysPage: View {
     /// 单击的设置下面的说明：语音键说一下默认的 Fn；开了长按 / 双击时说明单击现在什么时候发。
     @ViewBuilder private func singleClickNote(_ key: GestureKey) -> some View {
         let c = model.config
-        let long = c[keyPath: key.gesturePath(.long)] != nil
-        let double = c[keyPath: key.gesturePath(.double)] != nil
+        let long = c[keyPath: key.gesturePath(.long, kind)] != nil
+        let double = c[keyPath: key.gesturePath(.double, kind)] != nil
         if long || double {
             RowDivider()
             Note(double
                  ? "开了双击：松手后要等 \(Int(doubleClickWindow * 1000)) 毫秒确认没有第二下，单击才发出去。"
+                    + (long ? "" : String(format: "按住不放的话，%.1f 秒后就直接发，不用等松手。", clickMaxHold))
                  : "开了长按：松手时才发单击，不再是一按下就发。")
         } else if key == .voice {
             RowDivider()
@@ -559,12 +679,12 @@ struct KeysPage: View {
     }
 
     private func gestureEditor(_ key: GestureKey, _ gesture: KeyGesture) -> some View {
-        let path = key.gesturePath(gesture)
+        let path = key.gesturePath(gesture, kind)
         let combo = Binding<KeyCombo>(
             get: { model.config[keyPath: path] ?? .none },
             set: { model.config[keyPath: path] = $0 }
         )
-        return PopoverPanel(title: "\(key.title) · \(gesture.title)") {
+        return PopoverPanel(title: "\(key.title(on: kind)) · \(gesture.title)") {
             ComboEditor(combo: combo, ui: ui, accent: theme.accent)
             RowDivider()
             if gesture == .long {
@@ -598,14 +718,15 @@ struct KeysPage: View {
         let spec = self.art
         return ZStack {
             if let art {
-                ForEach(MappingControl.allCases) { control in
+                ForEach(kind.controls) { control in
                     if let anchor = anchors[.card(control)] {
                         let cardRect = proxy[anchor]
-                        let spot = spec.centers[control.hotspot]!
+                        let spot = spec.centers[control.hotspot] ?? CGPoint(x: 0.5, y: 0.5)
                         let radius = (spec.radii[control.hotspot] ?? 0.3) * art.width
                         let center = CGPoint(x: art.minX + spot.x * art.width, y: art.minY + spot.y * art.height)
-                        let start = CGPoint(x: control.onLeft ? cardRect.maxX : cardRect.minX, y: cardRect.midY)
-                        let end = CGPoint(x: center.x + (control.onLeft ? -radius : radius), y: center.y)
+                        let onLeft = control.onLeft(on: kind)
+                        let start = CGPoint(x: onLeft ? cardRect.maxX : cardRect.minX, y: cardRect.midY)
+                        let end = CGPoint(x: center.x + (onLeft ? -radius : radius), y: center.y)
                         let lit = isLit(control)
                         Path { path in
                             path.move(to: start)

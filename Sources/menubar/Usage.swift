@@ -3,7 +3,7 @@ import Foundation
 /// 首页「洞察」用的使用次数：每天、每台设备、每个控件按了几次。
 ///
 /// 只记次数，不记任何文字、按键内容或时间点（AGENTS.md：不能把用户的按键内容写进文件）。
-/// 次数只来自设备配置口上报的按键（AU05 的语音键、确定、取消、旋钮），和电脑键盘无关。
+/// 次数只来自设备自己上报的按键（AU05 配置口的语音键、确定、取消、旋钮；AI Passport 蓝牙上报的三个键），和电脑键盘无关。
 /// 存在 `~/Library/Application Support/Lepak/usage.json`，只在本机。
 struct UsageData: Codable, Equatable, Sendable {
     /// 日期（yyyy-MM-dd，本地时区）→ 设备 → 控件（`MappingControl.rawValue`）→ 次数。
@@ -30,8 +30,9 @@ struct UsageSummary: Equatable {
 
 final class Usage: @unchecked Sendable {
     static let shared = Usage()
-    /// 现在只有 AU05。以后接别的设备，用各自的名字记，首页会按设备分开显示。
+    /// 每台设备用各自的名字记，首页按设备分开显示。
     static let au05 = "Ulanzi AU05"
+    static let passport = "AI Passport"
 
     private let lock = NSLock()
     private var data: UsageData

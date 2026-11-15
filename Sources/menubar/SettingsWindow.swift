@@ -91,11 +91,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }()
         let model = SettingsModel()
         model.showSampleDevice()
-        model.record(.knobPressTurn, "切到右边桌面", KeyCombo(keyCode: 124, control: true))
-        model.record(.voice, "语音输入", KeyCombo(keyCode: FunctionKey.virtualKey))
-        model.record(.knobPress, "删到行首", KeyCombo(keyCode: 51, command: true))
-        model.record(.knobTurn, "移动光标", nil)
-        model.record(.confirm, "确定", KeyCombo(keyCode: 36))
+        model.record(.au05, .knobPressTurn, "切到右边桌面", KeyCombo(keyCode: 124, control: true))
+        model.record(.au05, .voice, "语音输入", KeyCombo(keyCode: FunctionKey.virtualKey))
+        model.record(.au05, .knobPress, "删到行首", KeyCombo(keyCode: 51, command: true))
+        model.record(.au05, .knobTurn, "移动光标", nil)
+        model.record(.au05, .confirm, "确定", KeyCombo(keyCode: 36))
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let original = model.config
         defer { model.config = original }   // 下面会临时换主题，画完改回来
@@ -122,6 +122,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         pages.append(Page(section: au05, theme: .workBuddy, appearance: .aqua, name: "device-au05-workbuddy-light"))
         pages.append(Page(section: au05, appearance: .darkAqua, name: "device-au05-gestures-dark", gestures: true))
         pages.append(Page(section: au05, appearance: .aqua, name: "device-au05-ulanzi-light", gestures: true, ulanzi: true))
+        pages.append(Page(section: .device(.passport), appearance: .aqua, control: .voice, name: "device-passport-gestures-light", gestures: true))
         pages.append(Page(section: .home, appearance: .darkAqua, name: "home-signed-out-dark", signedIn: false))
         pages.append(Page(section: .general, appearance: .aqua, name: "general-signed-out-light", signedIn: false))
         pages.append(Page(section: .general, appearance: .darkAqua, name: "general-signed-out-dark", signedIn: false))
@@ -132,10 +133,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             model.showSampleUlanziWarning(page.ulanzi)
             model.account = page.signedIn ? Account(appleUserID: "sample", email: "you@example.com") : nil
             model.config.deviceTheme = theme
-            for key in GestureKey.allCases {
-                for gesture in KeyGesture.allCases {
-                    let path = key.gesturePath(gesture)
-                    model.config[keyPath: path] = gestures ? key.suggestedCombo(gesture) : original[keyPath: path]
+            for device in DeviceKind.allCases {
+                for key in GestureKey.allCases {
+                    for gesture in KeyGesture.allCases {
+                        let path = key.gesturePath(gesture, device)
+                        model.config[keyPath: path] = gestures ? key.suggestedCombo(gesture) : original[keyPath: path]
+                    }
                 }
             }
             model.mappingUI.select(control)

@@ -5,22 +5,26 @@ import ServiceManagement
 import SwiftUI
 import LepakKit
 
-/// Lepak 支持的硬件型号。现在只有 AU05；以后加遥控器等别的设备，在这里加一项，侧栏「我的设备」就会多一行。
+/// Lepak 支持的硬件型号。以后加遥控器等别的设备，在这里加一项，侧栏「我的设备」就会多一行。
 /// 几台设备可以同时连着、同时工作，没有「当前设备」这回事；侧栏点哪台，只是在看哪台的设置。
-enum DeviceKind: String, CaseIterable, Identifiable {
+enum DeviceKind: String, CaseIterable, Identifiable, Sendable {
     case au05
+    /// FoloToy AI Passport，刷了社区固件（InputBetter / FoloVibe Key）后通过蓝牙连接，见 `PassportLink`。
+    case passport
 
     var id: String { rawValue }
 
     var name: String {
         switch self {
         case .au05: return "Ulanzi AU05"
+        case .passport: return "AI Passport"
         }
     }
 
     var systemImage: String {
         switch self {
         case .au05: return "mic.and.signal.meter"
+        case .passport: return "rectangle.portrait"
         }
     }
 
@@ -28,6 +32,15 @@ enum DeviceKind: String, CaseIterable, Identifiable {
     var usageName: String {
         switch self {
         case .au05: return Usage.au05
+        case .passport: return Usage.passport
+        }
+    }
+
+    /// 按键页上能设置的控件。
+    var controls: [MappingControl] {
+        switch self {
+        case .au05: return MappingControl.allCases
+        case .passport: return [.confirm, .voice, .cancel]   // 从上到下：上键、OK 键、下键
         }
     }
 
@@ -62,6 +75,7 @@ enum SettingsSection: Hashable, Identifiable {
 /// 按键处理刚做过的一件事：哪个控件、做了什么、发了什么键。
 struct DeviceAction: Identifiable, Equatable {
     let id = UUID()
+    let device: DeviceKind
     let control: MappingControl
     let title: String
     let combo: KeyCombo?
@@ -74,6 +88,8 @@ struct DeviceSnapshot: Equatable {
     var percent: Int?
     var millivolts: Int?
     var charging = false
+    /// 没连上时补一句原因，比如「蓝牙已关闭」；nil 就只显示连接状态。
+    var note: String?
 }
 
 /// 设置窗口和菜单共用的状态。只在主线程使用。
@@ -87,7 +103,12 @@ final class SettingsModel: ObservableObject {
             if config != oldValue { Config.update(config) }
         }
     }
-    @Published var section: SettingsSection = .home
+    @Published var section: SettingsSection = .home {
+        didSet {
+            // 换页时收起弹出的设置：几台设备的按键页共用同一份界面状态。
+            if section != oldValue { mappingUI.closeEditor() }
+        }
+    }
     /// 设置窗口是否全屏。全屏时没有红黄绿按钮，侧栏顶上不用再给它们留位置。
     @Published var isFullScreen = false
     /// 用 Apple 登录的账号（见 `AppleAccount`）；nil 是没登录。侧栏底部按它显示头像、邮箱和状态。
@@ -106,6 +127,7 @@ final class SettingsModel: ObservableObject {
     /// 按键映射页的选中和编辑状态。
     let mappingUI = MappingUIState()
     @Published private(set) var device = DeviceSnapshot()
+    @Published private(set) var passport = DeviceSnapshot(link: .disconnected)
     @Published private(set) var accessibilityTrusted = AXIsProcessTrusted()
     @Published private(set) var inputMonitoringAllowed = CGPreflightListenEventAccess()
     @Published private(set) var ulanziRunning = false
@@ -165,10 +187,10 @@ final class SettingsModel: ObservableObject {
 
     var theme: DeviceTheme { config.deviceTheme }
 
-    func record(_ control: MappingControl, _ title: String, _ combo: KeyCombo?) {
-        let action = DeviceAction(control: control, title: title, combo: combo, date: Date())
+    func record(_ device: DeviceKind, _ control: MappingControl, _ title: String, _ combo: KeyCombo?) {
+        let action = DeviceAction(device: device, control: control, title: title, combo: combo, date: Date())
         // 同一轮转动会连续报告，只保留第一条，免得刷屏。
-        if let last = recentActions.first, last.control == control, last.title == title,
+        if let last = recentActions.first, last.device == device, last.control == control, last.title == title,
            action.date.timeIntervalSince(last.date) < 1 {
             return
         }
@@ -194,11 +216,16 @@ final class SettingsModel: ObservableObject {
         ulanziRunning = running
     }
 
-    /// 某台设备的连接和电量。现在只接了 AU05；以后每种设备各自上报。
+    /// 某台设备的连接和电量。
     func snapshot(of kind: DeviceKind) -> DeviceSnapshot {
         switch kind {
         case .au05: return device
+        case .passport: return passport
         }
+    }
+
+    func updatePassport(_ snapshot: DeviceSnapshot) {
+        passport = snapshot
     }
 
     var versionText: String {
@@ -220,6 +247,7 @@ final class SettingsModel: ObservableObject {
     /// 开发用截图时显示一份示例设备状态。
     func showSampleDevice() {
         device = DeviceSnapshot(link: .connected, percent: 50, millivolts: 3670, charging: false)
+        passport = DeviceSnapshot(link: .connected, percent: 87, millivolts: 4012, charging: false)
     }
 
     func refreshPermissions() {
@@ -259,18 +287,30 @@ final class SettingsModel: ObservableObject {
         }
     }
 
-    /// 按键相关的设置是否都是默认值（外观主题不算）。
-    var keysAreDefault: Bool {
-        var defaults = AppConfig()
-        defaults.deviceTheme = config.deviceTheme
-        return config == defaults
+    /// 这台设备的按键设置是否都是默认值（AU05 的外观主题不算）。
+    func keysAreDefault(_ kind: DeviceKind) -> Bool {
+        switch kind {
+        case .au05:
+            var defaults = AppConfig()
+            defaults.deviceTheme = config.deviceTheme
+            defaults.passport = config.passport
+            return config == defaults
+        case .passport:
+            return config.passport == PassportKeys()
+        }
     }
 
-    /// 按键恢复默认，外观主题保持不变。
-    func resetKeys() {
-        var defaults = AppConfig()
-        defaults.deviceTheme = config.deviceTheme
-        config = defaults
+    /// 这台设备的按键恢复默认，别的设备和 AU05 的外观主题保持不变。
+    func resetKeys(_ kind: DeviceKind) {
+        switch kind {
+        case .au05:
+            var defaults = AppConfig()
+            defaults.deviceTheme = config.deviceTheme
+            defaults.passport = config.passport
+            config = defaults
+        case .passport:
+            config.passport = PassportKeys()
+        }
     }
 
     func openAccessibilitySettings() {

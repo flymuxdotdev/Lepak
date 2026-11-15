@@ -199,7 +199,42 @@ enum KeyGesture: String, CaseIterable, Identifiable, Sendable {
 /// 开了双击时，松手后等这么久没有第二下，才算单击。
 let doubleClickWindow: TimeInterval = 0.25
 
+/// 只开了双击（没开长按）时：按住超过这么久还没松手，就不会是双击的第一下（实测正常点一下都在 0.3 秒内），
+/// 不等松手，马上按单击发出去。比如按着语音键开始说话，Typeless 不会等到松手才开始录。
+let clickMaxHold: TimeInterval = 0.3
+
+/// AI Passport 三个键的设置：OK 键对应语音键、上键对应确定键、下键对应取消键，默认值和 AU05 一样。
+/// 每台设备的按键分开设置，改这里不影响 AU05。
+struct PassportKeys: Codable, Equatable, Sendable {
+    var voice = KeyCombo.fnKey
+    var voiceLong: KeyCombo?
+    var voiceDouble: KeyCombo?
+    var confirm = KeyCombo(keyCode: 36)
+    var confirmLong: KeyCombo?
+    var confirmDouble: KeyCombo?
+    var cancel = KeyCombo(keyCode: 53)
+    var cancelLong: KeyCombo?
+    var cancelDouble: KeyCombo?
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = PassportKeys()
+        voice = try c.decodeIfPresent(KeyCombo.self, forKey: .voice) ?? d.voice
+        voiceLong = try c.decodeIfPresent(KeyCombo.self, forKey: .voiceLong)
+        voiceDouble = try c.decodeIfPresent(KeyCombo.self, forKey: .voiceDouble)
+        confirm = try c.decodeIfPresent(KeyCombo.self, forKey: .confirm) ?? d.confirm
+        confirmLong = try c.decodeIfPresent(KeyCombo.self, forKey: .confirmLong)
+        confirmDouble = try c.decodeIfPresent(KeyCombo.self, forKey: .confirmDouble)
+        cancel = try c.decodeIfPresent(KeyCombo.self, forKey: .cancel) ?? d.cancel
+        cancelLong = try c.decodeIfPresent(KeyCombo.self, forKey: .cancelLong)
+        cancelDouble = try c.decodeIfPresent(KeyCombo.self, forKey: .cancelDouble)
+    }
+}
+
 /// 可以在设置里调整的所有选项。默认值就是改设置界面之前写死的行为。
+/// AU05 的按键设置直接放在顶层（改成多设备之前就是这样存的），别的设备各有一组（比如 `passport`）。
 struct AppConfig: Codable, Equatable, Sendable {
     var deviceTheme = DeviceTheme.standard
     /// 语音键单击。默认 Fn：没开长按 / 双击时和以前一样，按下就按下 Fn、松开就松开（见 `FunctionKey`）。
@@ -222,6 +257,7 @@ struct AppConfig: Codable, Equatable, Sendable {
     var caretInTextFields = true
     var reverseCaret = false
     var switchSpacesWhilePressed = true
+    var passport = PassportKeys()
 
     init() {}
 
@@ -248,11 +284,13 @@ struct AppConfig: Codable, Equatable, Sendable {
         reverseCaret = try c.decodeIfPresent(Bool.self, forKey: .reverseCaret) ?? d.reverseCaret
         switchSpacesWhilePressed = try c.decodeIfPresent(Bool.self, forKey: .switchSpacesWhilePressed)
             ?? d.switchSpacesWhilePressed
+        passport = try c.decodeIfPresent(PassportKeys.self, forKey: .passport) ?? d.passport
     }
 
 }
 
 /// 可以设单击、长按、双击的三个键：语音键、确定键、取消键。
+/// AI Passport 的 OK、上、下三个键也按这三个角色处理（OK = 语音、上 = 确定、下 = 取消），设置各存一份。
 enum GestureKey: String, CaseIterable, Identifiable, Sendable {
     case voice, confirm, cancel
 
@@ -290,22 +328,57 @@ enum GestureKey: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var singlePath: WritableKeyPath<AppConfig, KeyCombo> {
-        switch self {
-        case .voice: return \.voice
-        case .confirm: return \.confirm
-        case .cancel: return \.cancel
+    /// 在某台设备上的名字：AU05 按用途叫（语音键…），AI Passport 按键的样子叫（OK 键、上键、下键）。
+    func title(on device: DeviceKind) -> String {
+        switch device {
+        case .au05: return title
+        case .passport:
+            switch self {
+            case .voice: return "OK 键"
+            case .confirm: return "上键"
+            case .cancel: return "下键"
+            }
         }
     }
 
-    func gesturePath(_ gesture: KeyGesture) -> WritableKeyPath<AppConfig, KeyCombo?> {
-        switch (self, gesture) {
-        case (.voice, .long): return \.voiceLong
-        case (.voice, .double): return \.voiceDouble
-        case (.confirm, .long): return \.confirmLong
-        case (.confirm, .double): return \.confirmDouble
-        case (.cancel, .long): return \.cancelLong
-        case (.cancel, .double): return \.cancelDouble
+    /// 日志和「已发送」提示里的短名字。
+    func name(on device: DeviceKind) -> String {
+        switch device {
+        case .au05: return name
+        case .passport:
+            switch self {
+            case .voice: return "OK"
+            case .confirm: return "上"
+            case .cancel: return "下"
+            }
+        }
+    }
+
+    func singlePath(_ device: DeviceKind) -> WritableKeyPath<AppConfig, KeyCombo> {
+        switch (device, self) {
+        case (.au05, .voice): return \.voice
+        case (.au05, .confirm): return \.confirm
+        case (.au05, .cancel): return \.cancel
+        case (.passport, .voice): return \.passport.voice
+        case (.passport, .confirm): return \.passport.confirm
+        case (.passport, .cancel): return \.passport.cancel
+        }
+    }
+
+    func gesturePath(_ gesture: KeyGesture, _ device: DeviceKind) -> WritableKeyPath<AppConfig, KeyCombo?> {
+        switch (device, self, gesture) {
+        case (.au05, .voice, .long): return \.voiceLong
+        case (.au05, .voice, .double): return \.voiceDouble
+        case (.au05, .confirm, .long): return \.confirmLong
+        case (.au05, .confirm, .double): return \.confirmDouble
+        case (.au05, .cancel, .long): return \.cancelLong
+        case (.au05, .cancel, .double): return \.cancelDouble
+        case (.passport, .voice, .long): return \.passport.voiceLong
+        case (.passport, .voice, .double): return \.passport.voiceDouble
+        case (.passport, .confirm, .long): return \.passport.confirmLong
+        case (.passport, .confirm, .double): return \.passport.confirmDouble
+        case (.passport, .cancel, .long): return \.passport.cancelLong
+        case (.passport, .cancel, .double): return \.passport.cancelDouble
         }
     }
 
@@ -339,6 +412,9 @@ enum Config {
         return box.value
     }
 
+    /// 配置改了。在调用 `update` 的线程上发出（设置界面改的，就是主线程）。
+    static let didChange = Notification.Name("local.lepak.config.didChange")
+
     static func update(_ value: AppConfig) {
         box.lock.lock()
         box.value = value
@@ -346,6 +422,7 @@ enum Config {
         if let data = try? JSONEncoder().encode(value) {
             UserDefaults.standard.set(data, forKey: defaultsKey)
         }
+        NotificationCenter.default.post(name: didChange, object: nil)
     }
 
     /// 以前用过的 Bundle ID（新的在前）：local.lepak 是正式开发者 ID 之前的临时 ID，local.vibe-key 是改名前的。

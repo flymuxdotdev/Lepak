@@ -6,6 +6,11 @@ import LepakKit
 @MainActor
 final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let session = DeviceSession()
+    /// AI Passport（社区固件）走蓝牙，和 AU05 同时工作。
+    private let passport = PassportLink()
+    private var passportState = PassportLinkState.searching
+    private var passportBattery: PassportBattery?
+    private var configObserver: NSObjectProtocol?
     /// 调试：看 AU05 自己的键盘口有没有发键（比如长按时冒出来的 Command+H）。
     private let keyboard = KeyboardMonitor()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -72,11 +77,12 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.log(line)
             }
         }
-        DeviceKeys.setActionHandler { [weak self] control, title, combo in
+        DeviceKeys.setActionHandler { [weak self] device, control, title, combo in
             Task { @MainActor in
-                self?.settings.record(control, title, combo)
+                self?.settings.record(device, control, title, combo)
             }
         }
+        startPassport()
         Usage.shared.onChange { [weak self] data in
             Task { @MainActor in
                 self?.settings.usage = Usage.summarize(data)
@@ -196,6 +202,10 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             menu.addItem(title: linkLost ? "AU05 未连接" : "正在连接 AU05…", action: nil)
         }
+        if case .online = passportState {
+            let percent = passportBattery?.percent.map { " · 电量 \($0)%" } ?? ""
+            menu.addItem(title: "AI Passport 已连接\(percent)\(passportBattery?.charging == true ? " · 充电中" : "")", action: nil)
+        }
         if !FunctionKey.isTrusted {
             let item = menu.addItem(withTitle: "⚠️ 辅助功能未允许，按键发不出去…", action: #selector(openPermissions), keyEquivalent: "")
             item.target = self
@@ -241,8 +251,80 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
+    // MARK: AI Passport
+
+    private func startPassport() {
+        passport.onState = { [weak self] state in
+            Task { @MainActor in
+                guard let self else { return }
+                self.passportState = state
+                if case .online = state {} else { self.passportBattery = nil }
+                self.showPassport()
+            }
+        }
+        passport.onBattery = { [weak self] battery in
+            Task { @MainActor in
+                self?.passportBattery = battery
+                self?.showPassport()
+            }
+        }
+        passport.onButton = { [weak self] button, pressed in
+            let key: GestureKey = switch button {
+            case .ok: .voice
+            case .up: .confirm
+            case .down: .cancel
+            }
+            let note = DeviceKeys.handle(passportKey: key, pressed: pressed)
+            Task { @MainActor in
+                var line = "AI Passport 按键 \(button.rawValue) \(pressed ? "按下" : "松开")"
+                if let note { line += " " + note }
+                self?.recent = line
+                self?.log(line)
+            }
+        }
+        passport.onNote = { [weak self] line in
+            Task { @MainActor in self?.log(line) }
+        }
+        updatePassportKeys()
+        // 改了按键设置，屏幕上三个键旁边的提示马上跟着变。
+        configObserver = NotificationCenter.default.addObserver(forName: Config.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.updatePassportKeys() }
+        }
+        passport.start()
+    }
+
+    private func updatePassportKeys() {
+        let keys = Config.current.passport
+        passport.setKeyIcons([.ok: passportIcon(keys.voice), .up: passportIcon(keys.confirm), .down: passportIcon(keys.cancel)])
+    }
+
+    private func showPassport() {
+        var snapshot = DeviceSnapshot(link: .disconnected)
+        switch passportState {
+        case .online:
+            snapshot.link = .connected
+            snapshot.percent = passportBattery?.percent
+            snapshot.millivolts = passportBattery?.millivolts
+            snapshot.charging = passportBattery?.charging ?? false
+        case .connecting:
+            snapshot.link = .connecting
+        case .searching:
+            break
+        case .bluetoothOff:
+            snapshot.note = "蓝牙已关闭"
+        case .unauthorized:
+            snapshot.note = "没有允许 Lepak 使用蓝牙"
+        case .unsupported:
+            snapshot.note = "这台 Mac 不支持低功耗蓝牙"
+        }
+        if snapshot != settings.passport {
+            settings.updatePassport(snapshot)
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         FunctionKey.reset()
+        passport.stop()
         Usage.shared.flush()
     }
 
@@ -250,6 +332,29 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         FunctionKey.reset()
         NSApp.terminate(nil)
     }
+}
+
+/// AI Passport 屏幕上、三个键旁边的提示图标：按这个键单击发什么来选（协议里的固定图标 id），认不出来的就不显示。
+private func passportIcon(_ combo: KeyCombo) -> String {
+    if combo.isNone { return "" }
+    if combo == .fnKey { return "mic" }
+    let modifiers = (combo.command, combo.shift, combo.option, combo.control, combo.fn)
+    let plain = (false, false, false, false, false)
+    switch combo.keyCode {
+    case 36:   // 回车
+        if modifiers == plain || modifiers == (false, true, false, false, false) { return "enter" }
+        if modifiers == (true, false, false, false, false) { return "send" }
+    case 53 where modifiers == plain: return "esc"
+    case 51 where modifiers == plain: return "bksp"
+    case 117 where modifiers == plain: return "del"
+    case 48:   // Tab
+        if modifiers == plain { return "tab" }
+        if modifiers == (false, true, false, false, false) { return "stab" }
+    case 6 where modifiers == (true, false, false, false, false): return "undo"
+    case 56 where modifiers == (false, false, false, false, true): return "translate"   // Fn + 左 Shift：Typeless 翻译
+    default: break
+    }
+    return ""
 }
 
 private extension NSMenu {

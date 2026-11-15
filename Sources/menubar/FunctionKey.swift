@@ -88,10 +88,26 @@ enum FunctionKey {
         return true
     }
 
-    /// 点一下 Fn：按下，按住 `minHold` 再松开。语音键开了长按 / 双击、或者别的键设成 Fn 时用。
+    /// 点一下 Fn 时按住多久。不开长按 / 双击时 Fn 跟着手按住，实际一般按住 0.15～0.25 秒；
+    /// 只按 `minHold`（0.12 秒）正好在 Typeless 认得出来的下限上，偶尔会漏，所以取中间。
+    private static let tapHold: TimeInterval = 0.18
+
+    /// 点一下 Fn：按下，按住 `tapHold` 再松开。语音键开了长按 / 双击、或者别的键设成 Fn 时用。
     static func tap() {
-        guard handle(pressed: true) else { return }
-        _ = handle(pressed: false)
+        guard isTrusted else { return }
+        state.lock.lock()
+        defer { state.lock.unlock() }
+        guard !state.isDown else { return }
+        state.isDown = true
+        state.downAt = .now()
+        state.generation &+= 1
+        let generation = state.generation
+        state.poster.async {
+            _ = post(keyDown: true)
+        }
+        state.poster.asyncAfter(deadline: state.downAt + tapHold) {
+            release(generation)
+        }
     }
 
     private static func release(_ generation: Int) {

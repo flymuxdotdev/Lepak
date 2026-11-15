@@ -30,6 +30,8 @@
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
 	<string>Lepak 把语音键变成 Fn。</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Lepak 通过蓝牙连接 AI Passport，接收它上面的按键。</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

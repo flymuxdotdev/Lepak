@@ -22,6 +22,8 @@
 - 用 `CGEvent.post` 发出按键或滚轮事件（Fn、Return、Esc、退格、滚轮）。这是「发」，不是「听」，只需要「辅助功能」权限。
 - **设置窗口里的快捷键录制框**（`Sources/menubar/ShortcutRecorder.swift`，用户 2026-11-12 确认）：只在用户点了录制框、并且它是本窗口的焦点时，通过本窗口自己的按键事件（响应链里的 `keyDown` / `performKeyEquivalent` / `flagsChanged`）读取一次组合键，录完立刻停止并交出焦点。不用 CGEventTap、NSEvent 监听或 IOHID，不申请「输入监控」，不写日志。
 
+- **通过蓝牙接收 AI Passport 的按键**（`Sources/LepakKit/PassportLink.swift`，用户 2026-11-15 同意先支持社区固件的协议、用蓝牙连）：设备刷了社区固件（InputBetter / FoloVibe Key，协议 v1）后，自己通过低功耗蓝牙上报 OK、上、下三个键。只连这一个蓝牙服务，只需要「蓝牙」权限，不碰电脑键盘，不申请「输入监控」。
+
 - **首页「洞察」的使用次数**（`Sources/menubar/Usage.swift`，用户 2026-11-12 确认「只记次数」）：只统计设备配置口上报的按键（语音键、确定、取消、旋钮）每天按了几次，按设备分开，存在本机 `~/Library/Application Support/Lepak/usage.json`。不记文字、不记电脑键盘、不记具体时间点，也不估算口述时长或字数。
 
 用户定的界线：**不能监听整个系统的输入，也不能申请「输入监控」这类键盘监听权限**（用户对它很敏感）；在特定时机、只在本程序自己的窗口里读取按键是可以的。

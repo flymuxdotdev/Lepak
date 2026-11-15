@@ -543,28 +543,30 @@ private struct UlanziWarning: View {
 
 // MARK: 设备
 
-/// 一台设备的页面：顶上是设备名、连接和电量，右上角切换款式；下面是按键映射展台。
+/// 一台设备的页面：顶上是设备名、连接和电量，右上角切换款式（AU05）；下面是按键映射展台。
 /// 电量已经在标题旁边，电压、连接方式这类数字不再单独列（用户 2026-11-12）。
-/// 现在只有 AU05；以后别的设备也用这个外壳，展台换成它自己的。
 private struct DevicePage: View {
     @ObservedObject var model: SettingsModel
     let kind: DeviceKind
+
+    /// AU05 跟着它的款式配色，别的设备用标准配色。
+    private var theme: DeviceTheme { kind == .au05 ? model.theme : .standard }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
                 .padding(.horizontal, 28)
                 .padding(.top, 46)
-            if model.ulanziRunning {
+            if kind == .au05, model.ulanziRunning {
                 UlanziBanner(model: model)
                     .padding(.horizontal, 28)
                     .padding(.top, 16)
             }
-            KeysPage(model: model, ui: model.mappingUI)
+            KeysPage(model: model, ui: model.mappingUI, kind: kind)
         }
         // 设备页里的开关、选中状态用这台设备的主题色；窗口其他地方是固定的 `Brand.accent`。
-        .tint(model.theme.accent)
-        .toggleStyle(ThemedSwitch(accent: model.theme.accent))
+        .tint(theme.accent)
+        .toggleStyle(ThemedSwitch(accent: theme.accent))
     }
 
     private var header: some View {
@@ -579,16 +581,19 @@ private struct DevicePage: View {
                     }
                 }
                 Spacer(minLength: 12)
-                ThemeSwitcher(selection: $model.config.deviceTheme)
+                if kind == .au05 {
+                    ThemeSwitcher(selection: $model.config.deviceTheme)
+                }
             }
             HStack(spacing: 14) {
-                Text("点设备上的键或两侧的卡片，设置它发什么。改动立即生效。")
+                Text(kind == .au05 ? "点设备上的键或两侧的卡片，设置它发什么。改动立即生效。"
+                                   : "点设备上的键或右边的卡片，设置它发什么。改动立即生效，屏幕上的提示也会跟着变。")
                     .font(.system(size: 14))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                if !model.keysAreDefault {
-                    Button("恢复默认") { model.resetKeys() }
+                if !model.keysAreDefault(kind) {
+                    Button("恢复默认") { model.resetKeys(kind) }
                         .buttonStyle(PillButtonStyle(kind: .subtle, height: 32))
                 }
             }
@@ -597,7 +602,10 @@ private struct DevicePage: View {
     }
 
     private func statusText(_ device: DeviceSnapshot) -> String {
-        guard device.link == .connected, let percent = device.percent else { return device.link.text }
+        guard device.link == .connected else {
+            return device.note.map { "\(device.link.text) · \($0)" } ?? device.link.text
+        }
+        guard let percent = device.percent else { return device.link.text }
         return "已连接 · 电量 \(percent)%\(device.charging ? " · 充电中" : "")"
     }
 }
@@ -663,7 +671,7 @@ private struct AddDevicePage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 28) {
-                PageHeader(title: "添加设备", subtitle: "插上支持的设备，Lepak 会自动识别，不需要另外配对。")
+                PageHeader(title: "添加设备", subtitle: "支持的设备开机连上后，Lepak 会自动识别，不需要在系统设置里配对。")
                 VStack(alignment: .leading, spacing: 12) {
                     SectionTitle("支持的设备")
                     ForEach(DeviceKind.allCases) { kind in
@@ -683,8 +691,8 @@ private struct AddDevicePage: View {
     }
 
     private func deviceCard(_ kind: DeviceKind) -> some View {
-        let theme = model.theme
-        let art = DeviceArt.of(theme)
+        let theme = kind == .au05 ? model.theme : .standard
+        let art = DeviceArt.of(kind, theme: theme)
         let link = model.snapshot(of: kind).link
         return HStack(alignment: .top, spacing: 22) {
             ZStack {
@@ -731,6 +739,13 @@ private struct AddDevicePage: View {
                 "插上 AU05 的 USB 接收器。",
                 "如果装了 Ulanzi Studio，先退出它，免得两边同时接管 AU05。",
                 "侧栏「我的设备」里 AU05 旁边的圆点变绿，就是连上了。",
+            ]
+        case .passport:
+            return [
+                "先给 AI Passport 刷上社区固件（InputBetter 或 FoloVibe Key）。出厂的官方固件连不上 Lepak。",
+                "打开 Mac 的蓝牙，给 AI Passport 开机。Lepak 会自己找到它并连上，第一次会问能不能使用蓝牙，点允许。",
+                "如果开着 InputBetter 或 FoloVibe Key 的 App，先退出它：一台设备同时只能连一个程序。",
+                "侧栏「我的设备」里 AI Passport 旁边的圆点变绿，就是连上了。屏幕上会显示三个键现在发什么。",
             ]
         }
     }
