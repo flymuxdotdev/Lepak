@@ -30,7 +30,9 @@ public final class DeviceSession: @unchecked Sendable {
 
     public init() {}
 
+    /// 打开配置口（单独一条 HID 线程）。已经开着就什么都不做；`stop()` 之后可以再调用。
     public func start() {
+        guard loop.runLoop == nil else { return }
         let ready = DispatchSemaphore(value: 0)
         let thread = Thread { [self] in
             let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -68,6 +70,27 @@ public final class DeviceSession: @unchecked Sendable {
         thread.name = "Lepak HID"
         thread.start()
         ready.wait()
+    }
+
+    /// 关掉配置口、结束 HID 线程（用户在 Lepak 里移除了 AU05）。之后不再收按键、不再发心跳。
+    public func stop() {
+        guard let runLoop = loop.runLoop else { return }
+        loop.runLoop = nil
+        let done = DispatchSemaphore(value: 0)
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [self] in
+            if let manager {
+                IOHIDManagerUnscheduleFromRunLoop(manager, runLoop, CFRunLoopMode.defaultMode.rawValue)
+                IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+            }
+            manager = nil
+            device = nil
+            status = nil
+            CFRunLoopStop(runLoop)
+            done.signal()
+        }
+        CFRunLoopWakeUp(runLoop)
+        // HID 线程万一已经退出，不能让主线程一直等下去。
+        _ = done.wait(timeout: .now() + 1)
     }
 
     public func refresh() {

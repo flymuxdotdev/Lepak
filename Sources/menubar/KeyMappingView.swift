@@ -21,6 +21,8 @@ struct DeviceArt: Sendable {
     let centers: [Hotspot: CGPoint]
     /// 高亮圈的半径，按图宽的比例。
     let radii: [Hotspot: CGFloat]
+    /// 侧键这种长条形的键：键的宽（按图宽的比例）和高（按图高的比例）。有的话高亮画成贴着键的长条，引线接到键的外缘。
+    var keySizes: [Hotspot: CGSize] = [:]
 
     var image: NSImage? { NSImage(named: imageName) }
 
@@ -50,18 +52,30 @@ struct DeviceArt: Sendable {
         radii: [.knob: 0.37, .mic: 0.28, .check: 0.28, .cancel: 0.28]
     )
 
-    /// AI Passport：没有实拍图，用代码画（`PassportSketch`）。竖着的卡片，上面是屏幕，屏幕右边从上到下是上键、OK、下键。
+    /// AI Passport：没有实拍图，用代码画（`PassportSketch`）。竖着的机身，正面几乎全是屏幕；
+    /// 三个键在机身右侧边上，从上到下是上键、下键、OK（OK 最长）。位置按产品图量的比例。
     static let passport = DeviceArt(
         imageName: "PassportArt",
         sketch: .passport,
-        aspect: 0.64,
+        aspect: 0.726,
         centers: [
-            .check: CGPoint(x: 0.885, y: 0.200),
-            .mic: CGPoint(x: 0.885, y: 0.335),
-            .cancel: CGPoint(x: 0.885, y: 0.470),
+            .check: CGPoint(x: 1.004, y: 0.309),
+            .cancel: CGPoint(x: 1.004, y: 0.542),
+            .mic: CGPoint(x: 1.004, y: 0.754),
         ],
-        radii: [.check: 0.085, .mic: 0.085, .cancel: 0.085]
+        radii: [.check: 0.08, .cancel: 0.08, .mic: 0.10],
+        keySizes: [
+            .check: CGSize(width: 0.03, height: 0.091),
+            .cancel: CGSize(width: 0.03, height: 0.091),
+            .mic: CGSize(width: 0.03, height: 0.140),
+        ]
     )
+
+    /// 引线接到键的哪里：离键中心多远（点）。
+    func leaderReach(_ spot: Hotspot, width: CGFloat) -> CGFloat {
+        if let key = keySizes[spot] { return key.width * width / 2 + 7 }
+        return (radii[spot] ?? 0.3) * width
+    }
 
     static func of(_ theme: DeviceTheme) -> DeviceArt {
         switch theme {
@@ -109,15 +123,28 @@ struct DeviceArtView: View {
                 if let onTap {
                     ForEach(art.spots, id: \.self) { spot in
                         let center = art.centers[spot]!
-                        let radius = (art.radii[spot] ?? 0.3) * size.width
-                        Circle()
-                            .strokeBorder(accent, lineWidth: highlighted == spot ? 2.5 : 0)
-                            .background(Circle().fill(accent.opacity(highlighted == spot ? 0.12 : 0.001)))
-                            .shadow(color: accent.opacity(highlighted == spot ? 0.45 : 0), radius: 8)
-                            .frame(width: radius * 2, height: radius * 2)
-                            .position(x: center.x * size.width, y: center.y * size.height)
-                            .onTapGesture { onTap(spot) }
-                            .help(spotName(spot))
+                        let lit = highlighted == spot
+                        Group {
+                            if let key = art.keySizes[spot] {
+                                // 侧键：贴着键的一圈长条，比键大一点，好点中。
+                                let shape = RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                shape
+                                    .strokeBorder(accent, lineWidth: lit ? 2.5 : 0)
+                                    .background(shape.fill(accent.opacity(lit ? 0.18 : 0.001)))
+                                    .shadow(color: accent.opacity(lit ? 0.45 : 0), radius: 8)
+                                    .frame(width: key.width * size.width + 14, height: key.height * size.height + 14)
+                            } else {
+                                let radius = (art.radii[spot] ?? 0.3) * size.width
+                                Circle()
+                                    .strokeBorder(accent, lineWidth: lit ? 2.5 : 0)
+                                    .background(Circle().fill(accent.opacity(lit ? 0.12 : 0.001)))
+                                    .shadow(color: accent.opacity(lit ? 0.45 : 0), radius: 8)
+                                    .frame(width: radius * 2, height: radius * 2)
+                            }
+                        }
+                        .position(x: center.x * size.width, y: center.y * size.height)
+                        .onTapGesture { onTap(spot) }
+                        .help(spotName(spot))
                     }
                 }
             }
@@ -136,58 +163,91 @@ struct DeviceArtView: View {
     }
 }
 
-/// AI Passport 的简图：深色机身，上面一块竖屏，屏幕右边三个圆键（上、OK、下），下半截是喇叭孔。
-/// 键的位置和 `DeviceArt.passport` 对齐。
+/// AI Passport 的简图：深色圆角机身，正面是一整块竖屏（显示待机页：连接方式、电量点、点阵话筒和 READY），
+/// 右侧边上三个侧键（上、下、OK），左侧边上是电源键。侧键的位置和 `DeviceArt.passport` 对齐。
 private struct PassportSketch: View {
     let size: CGSize
+
+    /// 点阵话筒，和设备待机页上的图案一样是一颗颗绿点。
+    private static let micDots = [
+        "...XXX...",
+        "..XXXXX..",
+        "..XXXXX..",
+        "..XXXXX..",
+        "X.XXXXX.X",
+        "X..XXX..X",
+        ".X.....X.",
+        "..XXXXX..",
+        "....X....",
+        "..XXXXX..",
+    ]
 
     var body: some View {
         let w = size.width
         let h = size.height
         let art = DeviceArt.passport
+        let green = Color(red: 0.24, green: 0.86, blue: 0.55)
+        let pitch = w * 0.034
         ZStack(alignment: .topLeading) {
-            RoundedRectangle(cornerRadius: w * 0.10, style: .continuous)
-                .fill(LinearGradient(colors: [Color(white: 0.26), Color(white: 0.14)], startPoint: .top, endPoint: .bottom))
-                .overlay(RoundedRectangle(cornerRadius: w * 0.10, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 1))
-            // 屏幕：240×320 竖屏。
-            RoundedRectangle(cornerRadius: w * 0.03, style: .continuous)
-                .fill(Color(red: 0.04, green: 0.07, blue: 0.06))
-                .overlay(
-                    VStack(spacing: h * 0.012) {
-                        Text("READY").font(.system(size: w * 0.075, weight: .bold, design: .monospaced))
-                        Text("LEPAK").font(.system(size: w * 0.045, weight: .medium, design: .monospaced)).opacity(0.6)
-                    }
-                    .foregroundStyle(Color(red: 0.45, green: 0.95, blue: 0.6))
-                )
-                .overlay(RoundedRectangle(cornerRadius: w * 0.03, style: .continuous)
-                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
-                .frame(width: w * 0.66, height: w * 0.66 * 4 / 3)
-                .position(x: w * 0.42, y: h * 0.335)
-            ForEach([Hotspot.check, .mic, .cancel], id: \.self) { spot in
-                let center = art.centers[spot]!
-                Circle()
-                    .fill(LinearGradient(colors: [Color(white: 0.42), Color(white: 0.24)], startPoint: .top, endPoint: .bottom))
-                    .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
-                    .overlay(Image(systemName: spot == .check ? "chevron.up" : spot == .cancel ? "chevron.down" : "circle.fill")
-                        .font(.system(size: w * (spot == .mic ? 0.035 : 0.05), weight: .bold))
-                        .foregroundStyle(Color(white: 0.75)))
-                    .frame(width: w * 0.11, height: w * 0.11)
-                    .position(x: center.x * w, y: center.y * h)
+            // 侧键先画，压在机身下面，只露出边缘一窄条。
+            ForEach([Hotspot.check, .cancel, .mic], id: \.self) { spot in
+                sideKey(height: h * (spot == .mic ? 0.140 : 0.091), width: w)
+                    .position(x: w * 1.004, y: art.centers[spot]!.y * h)
             }
-            // 喇叭孔。
-            VStack(spacing: w * 0.035) {
-                ForEach(0..<4, id: \.self) { _ in
-                    HStack(spacing: w * 0.035) {
-                        ForEach(0..<7, id: \.self) { _ in
-                            Circle().fill(Color.black.opacity(0.55)).frame(width: w * 0.03, height: w * 0.03)
+            sideKey(height: h * 0.096, width: w)
+                .position(x: -w * 0.004, y: h * 0.222)
+            RoundedRectangle(cornerRadius: w * 0.13, style: .continuous)
+                .fill(LinearGradient(colors: [Color(white: 0.22), Color(white: 0.11)], startPoint: .top, endPoint: .bottom))
+                .overlay(RoundedRectangle(cornerRadius: w * 0.13, style: .continuous)
+                    .strokeBorder(LinearGradient(colors: [Color.white.opacity(0.22), Color.white.opacity(0.05)],
+                                                 startPoint: .top, endPoint: .bottom), lineWidth: 1.2))
+            // 屏幕：240×320 竖屏。
+            RoundedRectangle(cornerRadius: w * 0.05, style: .continuous)
+                .fill(Color.black)
+                .overlay(RoundedRectangle(cornerRadius: w * 0.05, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.07), lineWidth: 1))
+                .overlay(alignment: .top) {
+                    HStack {
+                        Text("BLE").font(.system(size: w * 0.042, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color(white: 0.6))
+                        Spacer()
+                        HStack(spacing: w * 0.008) {
+                            ForEach(0..<5, id: \.self) { _ in
+                                Circle().fill(Color(white: 0.85)).frame(width: w * 0.012, height: w * 0.012)
+                            }
                         }
                     }
+                    .padding(.horizontal, w * 0.045)
+                    .padding(.top, w * 0.03)
                 }
-            }
-            .position(x: w * 0.5, y: h * 0.80)
+                .overlay {
+                    VStack(spacing: h * 0.07) {
+                        VStack(spacing: pitch * 0.3) {
+                            ForEach(Array(Self.micDots.enumerated()), id: \.offset) { _, row in
+                                HStack(spacing: pitch * 0.3) {
+                                    ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
+                                        Circle().fill(cell == "X" ? green : .clear)
+                                            .frame(width: pitch * 0.7, height: pitch * 0.7)
+                                    }
+                                }
+                            }
+                        }
+                        Text("READY").font(.system(size: w * 0.07, weight: .regular, design: .rounded))
+                            .tracking(w * 0.004)
+                            .foregroundStyle(green)
+                    }
+                    .offset(y: -h * 0.02)
+                }
+                .frame(width: w * 0.867, height: h * 0.845)
+                .position(x: w * (0.0685 + 0.867 / 2), y: h * (0.054 + 0.845 / 2))
         }
         .frame(width: w, height: h)
+    }
+
+    private func sideKey(height: CGFloat, width w: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: w * 0.01, style: .continuous)
+            .fill(LinearGradient(colors: [Color(white: 0.30), Color(white: 0.16)], startPoint: .leading, endPoint: .trailing))
+            .frame(width: w * 0.03, height: height)
     }
 }
 
@@ -722,7 +782,7 @@ struct KeysPage: View {
                     if let anchor = anchors[.card(control)] {
                         let cardRect = proxy[anchor]
                         let spot = spec.centers[control.hotspot] ?? CGPoint(x: 0.5, y: 0.5)
-                        let radius = (spec.radii[control.hotspot] ?? 0.3) * art.width
+                        let radius = spec.leaderReach(control.hotspot, width: art.width)
                         let center = CGPoint(x: art.minX + spot.x * art.width, y: art.minY + spot.y * art.height)
                         let onLeft = control.onLeft(on: kind)
                         let start = CGPoint(x: onLeft ? cardRect.maxX : cardRect.minX, y: cardRect.midY)

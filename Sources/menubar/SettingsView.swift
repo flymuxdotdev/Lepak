@@ -24,7 +24,6 @@ struct SettingsRootView: View {
                     switch model.section {
                     case .home: HomePage(model: model)
                     case .device(let kind): DevicePage(model: model, kind: kind)
-                    case .addDevice: AddDevicePage(model: model)
                     case .general: GeneralPage(model: model)
                     }
                 }
@@ -39,6 +38,21 @@ struct SettingsRootView: View {
                 }
             }
             .animation(.spring(duration: 0.3), value: model.flash?.id)
+            // 重命名：系统对话框带一个输入框。和「移除」的确认框挂在不同的视图上，两个才都弹得出来。
+            .alert(
+                "重命名设备",
+                isPresented: Binding(
+                    get: { model.renamingDevice != nil },
+                    set: { if !$0 { model.renamingDevice = nil } }
+                ),
+                presenting: model.renamingDevice
+            ) { kind in
+                TextField(kind.name, text: $model.renameText)
+                Button("保存") { model.rename(kind, to: model.renameText) }
+                Button("取消", role: .cancel) { model.renamingDevice = nil }
+            } message: { kind in
+                Text("最多 \(SettingsModel.maxNameLength) 个字。留空就用型号名「\(kind.name)」。")
+            }
         }
         // 标题栏是透明的，内容一直铺到窗口最顶上，红黄绿按钮落在侧栏里。
         .ignoresSafeArea()
@@ -46,6 +60,25 @@ struct SettingsRootView: View {
         .tint(accent)
         .toggleStyle(ThemedSwitch(accent: accent))
         .frame(minWidth: 1000, minHeight: 660)
+        .sheet(isPresented: Binding(
+            get: { model.addDeviceStep != nil },
+            set: { if !$0 { model.cancelAddDevice() } }
+        )) {
+            AddDeviceSheet(model: model)
+        }
+        .alert(
+            model.removingDevice.map { "移除 \(model.displayName($0))？" } ?? "",
+            isPresented: Binding(
+                get: { model.removingDevice != nil },
+                set: { if !$0 { model.removingDevice = nil } }
+            ),
+            presenting: model.removingDevice
+        ) { kind in
+            Button("移除", role: .destructive) { model.removeDevice(kind) }
+            Button("取消", role: .cancel) { model.removingDevice = nil }
+        } message: { kind in
+            Text("Lepak 会断开 \(model.displayName(kind))，不再处理它的按键。名字和按键设置会保留，以后再添加回来还能接着用。")
+        }
     }
 }
 
@@ -67,23 +100,28 @@ private struct Sidebar: View {
                 NavItem(title: "首页", systemImage: "house", selected: model.section == .home) {
                     model.section = .home
                 }
-                // 每台设备一行，圆点是连接状态；几台设备同时工作，点哪台只是看哪台的设置。
+                // 用户添加过的设备，每台一行，圆点是连接状态；几台设备同时工作，点哪台只是看哪台的设置。
+                // 右键一行可以重命名、移除；「添加设备」打开弹窗，不是一页。
                 Text("我的设备")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(.tertiary)
                     .padding(.horizontal, 12)
                     .padding(.top, 18)
                     .padding(.bottom, 4)
-                ForEach(DeviceKind.allCases) { kind in
+                ForEach(model.config.devices) { kind in
                     let link = model.snapshot(of: kind).link
-                    NavItem(title: kind.name, systemImage: kind.systemImage,
+                    NavItem(title: model.displayName(kind), systemImage: kind.systemImage,
                             selected: model.section == .device(kind), status: link.color) {
                         model.section = .device(kind)
                     }
                     .help(link.text)
+                    .contextMenu {
+                        Button("重命名…") { model.beginRename(kind) }
+                        Button("移除设备…") { model.removingDevice = kind }
+                    }
                 }
-                NavItem(title: "添加设备", systemImage: "plus", selected: model.section == .addDevice) {
-                    model.section = .addDevice
+                NavItem(title: "添加设备", systemImage: "plus", selected: model.addDeviceStep != nil) {
+                    model.beginAddDevice()
                 }
             }
             .padding(.horizontal, 10)
@@ -257,9 +295,11 @@ private struct HomePage: View {
             VStack(alignment: .leading, spacing: 28) {
                 Text("说话，不用打字")
                     .font(.system(size: 44, weight: .heavy))
-                InsightsSection(usage: model.usage, accent: Brand.accent,
+                InsightsSection(usage: model.usage, accent: Brand.accent, devices: model.config.devices,
+                                name: { model.displayName($0) },
                                 link: { model.snapshot(of: $0).link },
-                                open: { model.section = .device($0) })
+                                open: { model.section = .device($0) },
+                                add: { model.beginAddDevice() })
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 28)
@@ -272,8 +312,11 @@ private struct HomePage: View {
 private struct InsightsSection: View {
     let usage: UsageSummary
     let accent: Color
+    let devices: [DeviceKind]
+    let name: (DeviceKind) -> String
     let link: (DeviceKind) -> DeviceSnapshot.Link
     let open: (DeviceKind) -> Void
+    let add: () -> Void
 
     private static let knob: [MappingControl] = [.knobPress, .knobTurn, .knobPressTurn]
 
@@ -287,7 +330,7 @@ private struct InsightsSection: View {
                 tile("旋钮", Self.knob)
             }
             StreakCard(usage: usage, accent: accent)
-            DevicesCard(usage: usage, link: link, open: open)
+            DevicesCard(usage: usage, devices: devices, name: name, link: link, open: open, add: add)
         }
     }
 
@@ -459,54 +502,88 @@ private struct Heatmap: View {
     }
 }
 
-/// 按设备分开的次数。支持的设备都列出来（没用过的显示 0 次），点一行打开那台设备的页面。
+/// 按设备分开的次数。只列「我的设备」里的（没用过的显示 0 次），点一行打开那台设备的页面；
+/// 移除了的设备不再列出来（用户 2026-11-16），它以前的次数仍算在上面的总数和热力图里。
+/// 一台都没添加时，只显示一张「添加设备」的提示。
 private struct DevicesCard: View {
     let usage: UsageSummary
+    let devices: [DeviceKind]
+    let name: (DeviceKind) -> String
     let link: (DeviceKind) -> DeviceSnapshot.Link
     let open: (DeviceKind) -> Void
+    let add: () -> Void
 
     var body: some View {
-        var devices = usage.perDevice.sorted { $0.value > $1.value }.map(\.key)
-        for kind in DeviceKind.allCases where !devices.contains(kind.usageName) {
-            devices.append(kind.usageName)
-        }
-        return VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(devices.enumerated()), id: \.offset) { index, device in
-                if index > 0 { RowDivider() }
-                if let kind = DeviceKind(usageName: device) {
-                    Button { open(kind) } label: { row(device, kind: kind) }
-                        .buttonStyle(.plain)
-                } else {
-                    row(device, kind: nil)
+        let count = { (name: String) in usage.perDevice[name] ?? 0 }
+        // 次数一样时保持添加顺序。
+        let added = devices.enumerated()
+            .sorted { (count($0.element.usageName), -$0.offset) > (count($1.element.usageName), -$1.offset) }
+            .map(\.element)
+        return VStack(alignment: .leading, spacing: 12) {
+            if added.isEmpty {
+                emptyCard
+            } else {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(added.enumerated()), id: \.element) { index, kind in
+                        if index > 0 { RowDivider() }
+                        Button { open(kind) } label: { row(kind) }
+                            .buttonStyle(.plain)
+                    }
                 }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .card(padding: 0, radius: 18)
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .card(padding: 0, radius: 18)
     }
 
-    private func row(_ device: String, kind: DeviceKind?) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: kind?.systemImage ?? "questionmark.circle")
+    private var emptyCard: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "plus.circle.dashed")
+                .font(.system(size: 22))
+                .foregroundStyle(.secondary)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("还没有添加设备").font(.system(size: 15, weight: .semibold))
+                Text("添加设备后，Lepak 才会连接它、处理它的按键。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button("添加设备", action: add)
+                .buttonStyle(PillButtonStyle(kind: .accent(Brand.accent), height: 34))
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.16), style: StrokeStyle(lineWidth: 1.2, dash: [5, 4]))
+        )
+    }
+
+    /// 标题用用户起的名字，改过名的下面补一句型号。次数按使用记录里的设备名（型号名）查。
+    private func row(_ kind: DeviceKind) -> some View {
+        let device = kind.usageName
+        let title = name(kind)
+        let detail = title == device ? lastUsed(device) : "\(device) · \(lastUsed(device))"
+        return HStack(spacing: 12) {
+            Image(systemName: kind.systemImage)
                 .font(.system(size: 15))
                 .foregroundStyle(.secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 3) {
-                Text(device).font(.system(size: 15, weight: .semibold))
-                Text(lastUsed(device)).font(.system(size: 12)).foregroundStyle(.secondary)
+                Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
             }
             Spacer()
-            if let kind {
-                Circle().fill(link(kind).color).frame(width: 7, height: 7)
-            }
+            Circle().fill(link(kind).color).frame(width: 7, height: 7)
             Text("\(usage.perDevice[device] ?? 0) 次").font(.system(size: 15, weight: .bold))
-            if kind != nil {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 12)
         .contentShape(Rectangle())
@@ -519,25 +596,6 @@ private struct DevicesCard: View {
         if day == today { return "最近使用：今天" }
         if day == yesterday { return "最近使用：昨天" }
         return "最近使用：\(day)"
-    }
-}
-
-/// Ulanzi Studio 和 Lepak 同时运行时的提醒卡。
-private struct UlanziWarning: View {
-    @ObservedObject var model: SettingsModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label("Ulanzi Studio 正在运行", systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(.orange)
-            Note("它和 Lepak 会同时接管 AU05，同一个键可能被处理两次。")
-            Button("退出 Ulanzi Studio") { model.quitUlanzi() }
-                .buttonStyle(PillButtonStyle(kind: .accent(.orange), fill: true, height: 34))
-                .padding(.top, 4)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .card(padding: 18, fill: Color.orange.opacity(0.12))
     }
 }
 
@@ -574,15 +632,24 @@ private struct DevicePage: View {
         return VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .center, spacing: 16) {
                 HStack(alignment: .firstTextBaseline, spacing: 16) {
-                    Text(kind.name).font(.system(size: 40, weight: .heavy)).lineLimit(1)
+                    // 名字太长时先缩小字号、再截短，状态、款式切换和右边的按钮保持完整。鼠标停在名字上显示型号。
+                    Text(model.displayName(kind)).font(.system(size: 40, weight: .heavy)).lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .help(kind.name)
                     HStack(spacing: 6) {
                         Circle().fill(device.link.color).frame(width: 8, height: 8)
                         Text(statusText(device)).font(.system(size: 14, weight: .medium)).foregroundStyle(.secondary)
                     }
+                    .fixedSize()
                 }
                 Spacer(minLength: 12)
                 if kind == .au05 {
                     ThemeSwitcher(selection: $model.config.deviceTheme)
+                        .fixedSize()
+                }
+                HStack(spacing: 8) {
+                    CircleIconButton(systemImage: "pencil", help: "重命名") { model.beginRename(kind) }
+                    CircleIconButton(systemImage: "trash", help: "移除这台设备") { model.removingDevice = kind }
                 }
             }
             HStack(spacing: 14) {
@@ -592,6 +659,9 @@ private struct DevicePage: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 8)
+                if kind == .passport {
+                    MicBadge(status: model.passportMic)
+                }
                 if !model.keysAreDefault(kind) {
                     Button("恢复默认") { model.resetKeys(kind) }
                         .buttonStyle(PillButtonStyle(kind: .subtle, height: 32))
@@ -607,6 +677,69 @@ private struct DevicePage: View {
         }
         guard let percent = device.percent else { return device.link.text }
         return "已连接 · 电量 \(percent)%\(device.charging ? " · 充电中" : "")"
+    }
+}
+
+/// 设备页右上角的圆形图标按钮（重命名、移除），和款式切换一样高。
+private struct CircleIconButton: View {
+    let systemImage: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(Palette.card))
+                .overlay(Circle().strokeBorder(Palette.hairline))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+/// AI Passport 页上的一小块：Lepak 麦克风装没装、有没有程序在用。
+private struct MicBadge: View {
+    let status: PassportMic.Status
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: status == .listening ? "mic.fill" : "mic")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(color)
+            Text(text).font(.system(size: 13, weight: .medium))
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+        .background(Capsule().fill(Palette.raised))
+        .help(help)
+    }
+
+    private var text: String {
+        switch status {
+        case .notInstalled: return "Lepak 麦克风未安装"
+        case .ready: return "Lepak 麦克风已就绪"
+        case .listening: return "麦克风使用中"
+        }
+    }
+
+    private var color: Color {
+        switch status {
+        case .notInstalled: return .secondary
+        case .ready: return .green
+        case .listening: return .orange
+        }
+    }
+
+    private var help: String {
+        switch status {
+        case .notInstalled: return "装好 Lepak 麦克风后，在 Typeless 里把麦克风选成「Lepak 麦克风」，就能对着 AI Passport 说话。"
+        case .ready: return "在 Typeless 里把麦克风选成「Lepak 麦克风」。开始录音时设备自动开麦，录完自动关。"
+        case .listening: return "有程序正在用 Lepak 麦克风，AI Passport 的麦克风开着。"
+        }
     }
 }
 
@@ -662,92 +795,84 @@ private struct UlanziBanner: View {
     }
 }
 
-// MARK: 添加设备
+// MARK: 添加设备（弹窗）
 
-/// 支持哪些硬件、怎么连上。AU05 插上接收器就自动识别，不用配对；以后支持的设备加在 `DeviceKind` 里，这里自动多一张卡。
-private struct AddDevicePage: View {
+/// 「添加设备」弹窗，两步：先选型号（已添加的灰掉），再看着实时状态把它连上，点「完成」才加进「我的设备」。
+/// 第二步一进来 Lepak 就开始连这台（见 `SettingsModel.activeDevices`），取消或返回就断开。
+/// 以后支持的设备加在 `DeviceKind` 里，第一步自动多一张卡。
+struct AddDeviceSheet: View {
     @ObservedObject var model: SettingsModel
 
+    static let width: CGFloat = 620
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                PageHeader(title: "添加设备", subtitle: "支持的设备开机连上后，Lepak 会自动识别，不需要在系统设置里配对。")
-                VStack(alignment: .leading, spacing: 12) {
-                    SectionTitle("支持的设备")
-                    ForEach(DeviceKind.allCases) { kind in
-                        deviceCard(kind)
-                    }
-                    moreCard
-                }
-                if model.ulanziRunning {
-                    UlanziWarning(model: model)
-                }
+        Group {
+            switch model.addDeviceStep {
+            case .connect(let kind): connectStep(kind)
+            default: chooseStep
             }
-            .padding(.horizontal, 28)
-            .padding(.top, 46)
-            .padding(.bottom, 80)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(28)
+        .frame(width: Self.width)
+        .background(Palette.canvas)
+        .tint(Brand.accent)
+    }
+
+    // MARK: 第一步：选型号
+
+    private var chooseStep: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("添加设备").font(.system(size: 24, weight: .bold))
+                Text("选择你要连接的设备。").font(.system(size: 14)).foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 20)
+            VStack(spacing: 10) {
+                ForEach(DeviceKind.allCases) { kind in
+                    modelCard(kind)
+                }
+                moreCard
+            }
+            HStack {
+                Spacer()
+                Button("取消") { model.cancelAddDevice() }
+                    .buttonStyle(PillButtonStyle(kind: .subtle, height: 34))
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.top, 22)
         }
     }
 
-    private func deviceCard(_ kind: DeviceKind) -> some View {
-        let theme = kind == .au05 ? model.theme : .standard
-        let art = DeviceArt.of(kind, theme: theme)
-        let link = model.snapshot(of: kind).link
-        return HStack(alignment: .top, spacing: 22) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Palette.raised.opacity(0.6))
-                DeviceArtView(art: art, accent: theme.accent)
-                    .frame(width: 130 * art.aspect, height: 130)
-            }
-            .frame(width: 104, height: 150)
-            VStack(alignment: .leading, spacing: 16) {
-                HStack(spacing: 12) {
-                    Text(kind.name).font(.system(size: 20, weight: .bold))
-                    HStack(spacing: 6) {
-                        Circle().fill(link.color).frame(width: 7, height: 7)
-                        Text(link.text).font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button("打开设置") { model.section = .device(kind) }
-                        .buttonStyle(PillButtonStyle(kind: .subtle, height: 32))
+    private func modelCard(_ kind: DeviceKind) -> some View {
+        let added = model.isAdded(kind)
+        return Button { model.chooseDevice(kind) } label: {
+            HStack(spacing: 16) {
+                thumbnail(kind, height: 64)
+                    .frame(width: 64, height: 76)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(kind.name).font(.system(size: 16, weight: .semibold))
+                    Text(kind.connectionHint).font(.system(size: 13)).foregroundStyle(.secondary)
                 }
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(Array(Self.steps(kind).enumerated()), id: \.offset) { index, step in
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            Text("\(index + 1)")
-                                .font(.system(size: 12, weight: .bold))
-                                .frame(width: 22, height: 22)
-                                .background(Circle().fill(Palette.raised))
-                            Text(step)
-                                .font(.system(size: 14))
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
+                Spacer(minLength: 12)
+                if added {
+                    Text("已添加")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .frame(height: 24)
+                        .background(Capsule().fill(Palette.raised))
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.tertiary)
                 }
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .card(padding: 20, radius: 18)
-    }
-
-    private static func steps(_ kind: DeviceKind) -> [String] {
-        switch kind {
-        case .au05:
-            return [
-                "插上 AU05 的 USB 接收器。",
-                "如果装了 Ulanzi Studio，先退出它，免得两边同时接管 AU05。",
-                "侧栏「我的设备」里 AU05 旁边的圆点变绿，就是连上了。",
-            ]
-        case .passport:
-            return [
-                "先给 AI Passport 刷上社区固件（InputBetter 或 FoloVibe Key）。出厂的官方固件连不上 Lepak。",
-                "打开 Mac 的蓝牙，给 AI Passport 开机。Lepak 会自己找到它并连上，第一次会问能不能使用蓝牙，点允许。",
-                "如果开着 InputBetter 或 FoloVibe Key 的 App，先退出它：一台设备同时只能连一个程序。",
-                "侧栏「我的设备」里 AI Passport 旁边的圆点变绿，就是连上了。屏幕上会显示三个键现在发什么。",
-            ]
-        }
+        .buttonStyle(SheetCardButtonStyle())
+        .disabled(added)
+        .opacity(added ? 0.6 : 1)
     }
 
     /// 虚线框：还没支持的设备。
@@ -756,7 +881,7 @@ private struct AddDevicePage: View {
             Image(systemName: "plus.circle.dashed")
                 .font(.system(size: 20))
                 .foregroundStyle(.secondary)
-                .frame(width: 28)
+                .frame(width: 64)
             VStack(alignment: .leading, spacing: 4) {
                 Text("更多设备").font(.system(size: 15, weight: .semibold))
                 Text("遥控器等更多设备正在适配，支持后会出现在这里。")
@@ -765,12 +890,161 @@ private struct AddDevicePage: View {
             }
             Spacer()
         }
-        .padding(20)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.16), style: StrokeStyle(lineWidth: 1.2, dash: [5, 4]))
         )
+    }
+
+    // MARK: 第二步：连接
+
+    private func connectStep(_ kind: DeviceKind) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 12) {
+                Button { model.addDeviceStep = .choose } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 13, weight: .semibold))
+                        .frame(width: 30, height: 30)
+                        .background(Circle().fill(Palette.raised))
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("上一步")
+                Text("连接 \(kind.name)").font(.system(size: 24, weight: .bold))
+            }
+            .padding(.bottom, 20)
+            HStack(alignment: .top, spacing: 22) {
+                thumbnail(kind, height: 150)
+                    .frame(width: 112, height: 168)
+                VStack(alignment: .leading, spacing: 16) {
+                    status(kind)
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(Array(Self.steps(kind).enumerated()), id: \.offset) { index, step in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text("\(index + 1)")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .frame(width: 22, height: 22)
+                                    .background(Circle().fill(Palette.raised))
+                                Text(step)
+                                    .font(.system(size: 14))
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .card(padding: 20, radius: 18)
+            if kind == .au05, model.ulanziRunning {
+                UlanziBanner(model: model)
+                    .padding(.top, 12)
+            }
+            nameField(kind)
+                .padding(.top, 16)
+            HStack(spacing: 10) {
+                Note(model.snapshot(of: kind).link == .connected
+                     ? "已经连上了，点「完成」把它加进「我的设备」。"
+                     : "还没连上也可以先点「完成」，设备开机后会自动连上。")
+                Spacer(minLength: 12)
+                Button("取消") { model.cancelAddDevice() }
+                    .buttonStyle(PillButtonStyle(kind: .subtle, height: 34))
+                    .keyboardShortcut(.cancelAction)
+                Button("完成") { model.finishAddDevice() }
+                    .buttonStyle(PillButtonStyle(kind: .accent(Brand.accent), height: 34))
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 22)
+        }
+    }
+
+    /// 给这台设备起个名字，默认是型号名；以后在设备页或侧栏右键还能改。
+    private func nameField(_ kind: DeviceKind) -> some View {
+        HStack(spacing: 14) {
+            Text("名称").font(.system(size: 14, weight: .semibold))
+            TextField(kind.name, text: $model.newDeviceName)
+                .textFieldStyle(.plain)
+                .font(.system(size: 14))
+                .padding(.horizontal, 12)
+                .frame(height: 34)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Palette.card))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Palette.hairline))
+                .onSubmit { model.finishAddDevice() }
+            Text("以后也可以改").font(.system(size: 12)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// 实时连接状态：连上了是绿点和电量，没连上是转圈；蓝牙关着这类原因用橙色感叹号写出来。
+    private func status(_ kind: DeviceKind) -> some View {
+        let device = model.snapshot(of: kind)
+        let connected = device.link == .connected
+        return HStack(spacing: 8) {
+            if connected {
+                Circle().fill(Color.green).frame(width: 8, height: 8)
+            } else if device.note != nil {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.orange)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+            Text(statusText(device)).font(.system(size: 14, weight: .medium))
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 32)
+        .background(Capsule().fill(Palette.raised))
+    }
+
+    private func statusText(_ device: DeviceSnapshot) -> String {
+        if device.link == .connected {
+            return device.percent.map { "已连接 · 电量 \($0)%" } ?? "已连接"
+        }
+        return device.note ?? "正在寻找设备…"
+    }
+
+    private func thumbnail(_ kind: DeviceKind, height: CGFloat) -> some View {
+        let theme = kind == .au05 ? model.theme : .standard
+        let art = DeviceArt.of(kind, theme: theme)
+        return ZStack {
+            RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Palette.raised.opacity(0.6))
+            DeviceArtView(art: art, accent: theme.accent)
+                .frame(width: height * art.aspect, height: height)
+        }
+    }
+
+    private static func steps(_ kind: DeviceKind) -> [String] {
+        switch kind {
+        case .au05:
+            return [
+                "插上 AU05 的 USB 接收器，打开 AU05。",
+                "如果装了 Ulanzi Studio，先退出它，免得两边同时接管 AU05。",
+                "上面显示「已连接」，就是连上了。",
+            ]
+        case .passport:
+            return [
+                "先给 AI Passport 刷上社区固件（InputBetter 或 FoloVibe Key）。出厂的官方固件连不上 Lepak。",
+                "打开 Mac 的蓝牙，给 AI Passport 开机。Lepak 会自己找到它并连上，第一次会问能不能使用蓝牙，点允许。",
+                "如果开着 InputBetter 或 FoloVibe Key 的 App，先退出它：一台设备同时只能连一个程序。",
+                "上面显示「已连接」，就是连上了。屏幕上会显示三个键现在发什么。",
+            ]
+        }
+    }
+}
+
+/// 弹窗里整张可点的卡片：平时是卡片底色，按下深一层。
+private struct SheetCardButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(configuration.isPressed ? Palette.raised : Palette.card)
+            )
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Palette.hairline))
+            .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -805,11 +1079,6 @@ private struct GeneralPage: View {
                     SettingRow(title: "辅助功能（必需）",
                                detail: "用来发出 Fn、回车、方向键等按键，并判断光标是不是在输入框里。不开启的话 AU05 的按键都不起作用。") {
                         permission(model.accessibilityTrusted, kind: .accent(accent), open: model.openAccessibilitySettings)
-                    }
-                    RowDivider()
-                    SettingRow(title: "输入监控（仅调试）",
-                               detail: "只在开发调试时用来记录按键来源，正式版不需要，也不会申请。") {
-                        permission(model.inputMonitoringAllowed, kind: .subtle, open: model.openInputMonitoringSettings)
                     }
                 }
                 group("关于") {

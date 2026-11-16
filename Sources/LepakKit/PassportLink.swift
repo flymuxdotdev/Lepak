@@ -32,13 +32,15 @@ public enum PassportLinkState: Sendable, Equatable {
 /// - 设备报按键原始事件：`down`（按下）、`up`（松开）、`long`（按住 1 秒）。单击、双击、长按由 Lepak 自己判断，所以只用 down / up。
 /// - Mac 用 `config`、`state`、`keys` 控制屏幕：熄屏时间、显示的页面、三个键旁边的提示图标。
 ///
-/// 只接收设备自己上报的按键，不碰电脑键盘，不需要「输入监控」。不开设备的麦克风（`config` 里 `mic` 为 0）。
+/// 只接收设备自己上报的按键，不碰电脑键盘，不需要「输入监控」。
+/// 设备的麦克风只在 Lepak 要的时候开（`setMic`，有程序在用 Lepak 麦克风时），不让设备按 OK 时自己开麦（`config` 里 `mic` 为 0）。
 /// 一台设备同时只能被一个程序连着：FoloVibe Key / InputBetter 的 App 开着时，Lepak 连不上。
 public final class PassportLink: NSObject, @unchecked Sendable {
     // CBUUID 创建后不再改动，只读。
     nonisolated(unsafe) static let serviceUUID = CBUUID(string: "B5E10001-5A6C-4E8B-9F2D-7C3A1E0B4D21")
     nonisolated(unsafe) static let eventsUUID = CBUUID(string: "B5E10002-5A6C-4E8B-9F2D-7C3A1E0B4D21")
     nonisolated(unsafe) static let commandsUUID = CBUUID(string: "B5E10003-5A6C-4E8B-9F2D-7C3A1E0B4D21")
+    nonisolated(unsafe) static let audioUUID = CBUUID(string: "B5E10004-5A6C-4E8B-9F2D-7C3A1E0B4D21")
 
     // 回调在内部队列上调用，start() 之前设好。
     public var onState: ((PassportLinkState) -> Void)?
@@ -46,12 +48,18 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     /// 键按下（true）或松开（false）。断线时还按着的键会补一个松开。
     public var onButton: ((PassportButton, Bool) -> Void)?
     public var onNote: ((String) -> Void)?
+    /// 开麦后设备传来的声音：16 kHz 单声道，-1…1（每 20 毫秒一次）。
+    public var onAudio: (([Float]) -> Void)?
 
     private let queue = DispatchQueue(label: "local.lepak.passport")
     // 以下只在 queue 上读写。
     private var central: CBCentralManager?
     private var peripheral: CBPeripheral?
     private var commands: CBCharacteristic?
+    private var audio: CBCharacteristic?
+    /// Lepak 要设备开麦（有程序在用 Lepak 麦克风）。断线重连后照这个恢复。
+    private var micWanted = false
+    private var audioBlocks = 0
     private var buffer = Data()
     private var state = PassportLinkState.searching
     private var online = false
@@ -71,24 +79,30 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     /// 这么久没收到设备的任何消息，就当连接已经坏了，断开重连。设备那边是 15 秒。
     private static let silenceLimit: UInt64 = 15_000_000_000
 
+    /// 开始找设备、连上。`stop()` 之后再调用会重新开始（用户把 AI Passport 移除后又添加回来）。
     public func start() {
         queue.async { [self] in
             stopped = false
-            guard central == nil else { return }
+            guard central == nil else {
+                connectOrScan()
+                return
+            }
             // 不弹系统的「打开蓝牙」提示，蓝牙关着时设置里会写。
             central = CBCentralManager(delegate: self, queue: queue,
                                        options: [CBCentralManagerOptionShowPowerAlertKey: false])
         }
     }
 
-    /// 退出前调用：告诉设备 Mac 离线（屏幕切到离线页），再断开。
+    /// 退出前、或者用户移除了这台设备时调用：告诉设备 Mac 离线（屏幕切到离线页），再断开、停止扫描。
     public func stop() {
         queue.sync {
             stopped = true
             if online { send(["cmd": "bye"]) }
             timer?.cancel()
             timer = nil
+            if central?.isScanning == true { central?.stopScan() }
             if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+            setState(.searching)
         }
     }
 
@@ -99,6 +113,16 @@ public final class PassportLink: NSObject, @unchecked Sendable {
             guard next != keyIcons else { return }
             keyIcons = next
             if online { sendKeys() }
+        }
+    }
+
+    /// 开 / 关设备的麦克风。开着时屏幕显示「录音中」，声音通过 `onAudio` 送出；关掉回到待机页。
+    public func setMic(_ on: Bool) {
+        queue.async { [self] in
+            guard on != micWanted else { return }
+            micWanted = on
+            audioBlocks = 0
+            if online { sendMicState() }
         }
     }
 
@@ -141,6 +165,7 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     private func resetLink() {
         online = false
         commands = nil
+        audio = nil
         buffer.removeAll()
         timer?.cancel()
         timer = nil
@@ -203,7 +228,7 @@ public final class PassportLink: NSObject, @unchecked Sendable {
             if firstTime { note("握手成功：固件 \(firmware) \(version)") }
             setState(.online(firmware: version))
             sendConfig()
-            send(["cmd": "state", "st": "idle", "mode": "dict", "msg": ""])
+            sendMicState()
             sendKeys()
         case "key":
             handleKey(object)
@@ -250,6 +275,32 @@ public final class PassportLink: NSObject, @unchecked Sendable {
         }
     }
 
+    /// 声音帧：`FF FE type seq len_lo len_hi` + 负载，蓝牙上一次通知一帧，type 0x02 是 IMA ADPCM。
+    private func receivedAudio(_ data: Data) {
+        guard micWanted else { return }
+        var offset = data.startIndex
+        while data.endIndex - offset >= 6 {
+            guard data[offset] == 0xFF, data[offset + 1] == 0xFE else {
+                offset += 1
+                continue
+            }
+            let type = data[offset + 2]
+            let length = Int(data[offset + 4]) | Int(data[offset + 5]) << 8
+            let start = offset + 6
+            guard length > 0, data.endIndex - start >= length else { return }
+            if type == 0x02 {
+                let samples = PassportADPCM.decode(data.subdata(in: start..<(start + length)))
+                if !samples.isEmpty {
+                    onAudio?(samples)
+                    // 每 60 毫秒给屏幕发一次音量，驱动录音动画。
+                    audioBlocks += 1
+                    if audioBlocks % 3 == 0 { send(["cmd": "level", "v": PassportADPCM.level(samples)]) }
+                }
+            }
+            offset = start + length
+        }
+    }
+
     // MARK: 发
 
     private func sendHello() {
@@ -260,6 +311,17 @@ public final class PassportLink: NSObject, @unchecked Sendable {
         let clock = Int(Date().timeIntervalSince1970) + TimeZone.current.secondsFromGMT()
         send(["cmd": "config", "mic": 0, "engine": "Lepak", "screen_off": screenOffSeconds,
               "clock": clock, "sound": 0])
+    }
+
+    /// 设备只在「录音中」页面保持开麦，切到别的页面就停麦，所以开麦时同时切到 rec。
+    private func sendMicState() {
+        if micWanted {
+            send(["cmd": "mic", "on": 1])
+            send(["cmd": "state", "st": "rec", "mode": "dict", "msg": ""])
+        } else {
+            send(["cmd": "mic", "on": 0])
+            send(["cmd": "state", "st": "idle", "mode": "dict", "msg": ""])
+        }
     }
 
     private func sendKeys() {
@@ -351,7 +413,7 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
             central?.cancelPeripheralConnection(peripheral)
             return
         }
-        peripheral.discoverCharacteristics([Self.eventsUUID, Self.commandsUUID], for: service)
+        peripheral.discoverCharacteristics([Self.eventsUUID, Self.commandsUUID, Self.audioUUID], for: service)
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
@@ -366,10 +428,21 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
         }
         self.commands = commands
         peripheral.setNotifyValue(true, for: events)
+        // 声音通知一直订阅着：设备只在开麦时才发。
+        if let audio = characteristics.first(where: { $0.uuid == Self.audioUUID }) {
+            self.audio = audio
+            peripheral.setNotifyValue(true, for: audio)
+        }
     }
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                            error: Error?) {
+        if characteristic.uuid == Self.audioUUID {
+            if !characteristic.isNotifying {
+                note("订阅声音失败：\(error?.localizedDescription ?? "未知原因")")
+            }
+            return
+        }
         guard characteristic.uuid == Self.eventsUUID else { return }
         guard characteristic.isNotifying else {
             note("订阅按键通知失败：\(error?.localizedDescription ?? "未知原因")")
@@ -382,7 +455,11 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                            error: Error?) {
-        guard characteristic.uuid == Self.eventsUUID, let value = characteristic.value else { return }
-        received(value)
+        guard let value = characteristic.value else { return }
+        if characteristic.uuid == Self.eventsUUID {
+            received(value)
+        } else if characteristic.uuid == Self.audioUUID {
+            receivedAudio(value)
+        }
     }
 }

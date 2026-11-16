@@ -23,6 +23,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         let window = self.window ?? makeWindow()
         self.window = window
         NSApp.setActivationPolicy(.regular)
+        // 被 ⌘H 隐藏或最小化进 Dock 的窗口要先还原，不然只激活了程序，窗口还是看不见。
+        if NSApp.isHidden {
+            NSApp.unhide(nil)
+        }
+        if window.isMiniaturized {
+            window.deminiaturize(nil)
+        }
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
     }
@@ -111,6 +118,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             var ulanzi = false
             /// 侧栏底部显示示例账号（已登录）还是「未登录」。
             var signedIn = true
+            /// 「我的设备」里有哪些（默认全部，看空列表时传 []）。
+            var devices = DeviceKind.allCases
+            /// 用户起的名字（看改名后的样子）。
+            var names: [String: String] = [:]
         }
         let au05 = SettingsSection.device(.au05)
         var pages: [Page] = []
@@ -126,6 +137,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         pages.append(Page(section: .home, appearance: .darkAqua, name: "home-signed-out-dark", signedIn: false))
         pages.append(Page(section: .general, appearance: .aqua, name: "general-signed-out-light", signedIn: false))
         pages.append(Page(section: .general, appearance: .darkAqua, name: "general-signed-out-dark", signedIn: false))
+        pages.append(Page(section: .home, appearance: .aqua, name: "home-no-devices-light", devices: []))
+        pages.append(Page(section: .home, appearance: .darkAqua, name: "home-no-devices-dark", devices: []))
+        pages.append(Page(section: .home, appearance: .aqua, name: "home-passport-only-light", devices: [.passport]))
+        let renamed = ["au05": "书房的 AU05", "passport": "随身的小方块"]
+        pages.append(Page(section: au05, appearance: .aqua, name: "device-au05-renamed-light", names: renamed))
+        pages.append(Page(section: .device(.passport), appearance: .darkAqua, name: "device-passport-renamed-dark", names: renamed))
+        pages.append(Page(section: .home, appearance: .aqua, name: "home-renamed-light", names: renamed))
         for page in pages {
             let (section, theme, appearance, control, name, gestures) =
                 (page.section, page.theme, page.appearance, page.control, page.name, page.gestures)
@@ -133,6 +151,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             model.showSampleUlanziWarning(page.ulanzi)
             model.account = page.signedIn ? Account(appleUserID: "sample", email: "you@example.com") : nil
             model.config.deviceTheme = theme
+            model.config.devices = page.devices
+            model.config.deviceNames = page.names
             for device in DeviceKind.allCases {
                 for key in GestureKey.allCases {
                     for gesture in KeyGesture.allCases {
@@ -159,6 +179,50 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             try? rep.representation(using: .png, properties: [:])?.write(to: url)
             print("wrote", url.path)
         }
+        // 「添加设备」弹窗：真正的 sheet 截不到，单独放进一个离屏窗口里画。
+        model.section = .home
+        model.config.deviceTheme = .standard
+        let sheets: [(AddDeviceStep, [DeviceKind], NSAppearance.Name, String)] = [
+            (.choose, [], .aqua, "add-device-choose-light"),
+            (.choose, [.au05], .darkAqua, "add-device-choose-dark"),
+            (.connect(.au05), [], .aqua, "add-device-au05-light"),
+            (.connect(.au05), [], .darkAqua, "add-device-au05-dark"),
+            (.connect(.passport), [], .aqua, "add-device-passport-light"),
+        ]
+        for (step, devices, appearance, name) in sheets {
+            model.config.devices = devices
+            if case .connect(let kind) = step {
+                model.chooseDevice(kind)
+            } else {
+                model.addDeviceStep = step
+            }
+            model.showSampleUlanziWarning(name == "add-device-au05-dark")
+            if name == "add-device-passport-light" {
+                model.updatePassport(DeviceSnapshot(link: .disconnected, note: "蓝牙已关闭"))
+            } else {
+                model.showSampleDevice()
+            }
+            if name == "add-device-au05-light" {
+                model.update(status: nil, linkLost: false)
+            }
+            let host = NSHostingController(rootView: AddDeviceSheet(model: model))
+            let window = OffscreenWindow(contentViewController: host)
+            window.styleMask = [.titled, .fullSizeContentView]
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.appearance = NSAppearance(named: appearance)
+            window.setFrameOrigin(NSPoint(x: -8000, y: -8000))
+            window.orderFrontRegardless()
+            RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+            guard let view = window.contentView,
+                  let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            window.orderOut(nil)
+            let url = folder.appendingPathComponent("\(name).png")
+            try? rep.representation(using: .png, properties: [:])?.write(to: url)
+            print("wrote", url.path)
+        }
+        model.addDeviceStep = nil
     }
 
     /// 显示 Dock 图标时屏幕顶部会出现本程序的菜单栏，给它最基本的菜单，⌘W / ⌘Q 才好用。

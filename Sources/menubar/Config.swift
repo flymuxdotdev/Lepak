@@ -236,6 +236,12 @@ struct PassportKeys: Codable, Equatable, Sendable {
 /// 可以在设置里调整的所有选项。默认值就是改设置界面之前写死的行为。
 /// AU05 的按键设置直接放在顶层（改成多设备之前就是这样存的），别的设备各有一组（比如 `passport`）。
 struct AppConfig: Codable, Equatable, Sendable {
+    /// 用户自己添加的设备（侧栏「我的设备」，按添加顺序）。Lepak 只连接、只处理这里面的设备，
+    /// 没添加的不连（AI Passport 没添加时连蓝牙都不开）。旧配置里没有这个字段，读进来是空的，
+    /// 升级后要用户自己再添加一次（用户 2026-11-16 定的）。删除设备只从这里拿掉，按键设置保留。
+    var devices: [DeviceKind] = []
+    /// 用户给设备起的名字（键是 `DeviceKind.rawValue`）。没有就显示型号名。移除设备时保留，再添加回来还是这个名字。
+    var deviceNames: [String: String] = [:]
     var deviceTheme = DeviceTheme.standard
     /// 语音键单击。默认 Fn：没开长按 / 双击时和以前一样，按下就按下 Fn、松开就松开（见 `FunctionKey`）。
     var voice = KeyCombo.fnKey
@@ -265,6 +271,13 @@ struct AppConfig: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = AppConfig()
+        // 按名字读，认不出的（以后的新型号被旧版读到）跳过，不让整份配置失效。
+        var devices: [DeviceKind] = []
+        for name in try c.decodeIfPresent([String].self, forKey: .devices) ?? [] {
+            if let kind = DeviceKind(rawValue: name), !devices.contains(kind) { devices.append(kind) }
+        }
+        self.devices = devices
+        deviceNames = try c.decodeIfPresent([String: String].self, forKey: .deviceNames) ?? [:]
         deviceTheme = try c.decodeIfPresent(DeviceTheme.self, forKey: .deviceTheme) ?? d.deviceTheme
         voice = try c.decodeIfPresent(KeyCombo.self, forKey: .voice) ?? d.voice
         voiceLong = try c.decodeIfPresent(KeyCombo.self, forKey: .voiceLong)
