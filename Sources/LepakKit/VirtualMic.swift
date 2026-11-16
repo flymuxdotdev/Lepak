@@ -27,6 +27,7 @@ public final class VirtualMic: @unchecked Sendable {
     private var feedID = AudioObjectID(kAudioObjectUnknown)
     private var listenerBlock: AudioObjectPropertyListenerBlock?
     private var devicesBlock: AudioObjectPropertyListenerBlock?
+    private var restartedBlock: AudioObjectPropertyListenerBlock?
     private var ioProc: AudioDeviceIOProcID?
     private var feeding = false
     private var installed = false
@@ -42,6 +43,11 @@ public final class VirtualMic: @unchecked Sendable {
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.refresh() }
             devicesBlock = block
             AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, queue, block)
+            // 安装 / 卸载驱动时会重启系统音频服务，设备编号全部重新分配，重新找一遍。
+            var restarted = Self.address(kAudioHardwarePropertyServiceRestarted)
+            let restartedBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in self?.refresh() }
+            self.restartedBlock = restartedBlock
+            AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &restarted, queue, restartedBlock)
             refresh()
         }
     }

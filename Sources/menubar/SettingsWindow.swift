@@ -122,6 +122,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             var devices = DeviceKind.allCases
             /// 用户起的名字（看改名后的样子）。
             var names: [String: String] = [:]
+            /// 假装辅助功能、蓝牙都没允许，Lepak 麦克风没装（看提醒条和安装按钮）；默认都准备好了。
+            var setupMissing = false
         }
         let au05 = SettingsSection.device(.au05)
         var pages: [Page] = []
@@ -144,7 +146,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         pages.append(Page(section: au05, appearance: .aqua, name: "device-au05-renamed-light", names: renamed))
         pages.append(Page(section: .device(.passport), appearance: .darkAqua, name: "device-passport-renamed-dark", names: renamed))
         pages.append(Page(section: .home, appearance: .aqua, name: "home-renamed-light", names: renamed))
+        pages.append(Page(section: .home, appearance: .aqua, name: "home-setup-light", setupMissing: true))
+        pages.append(Page(section: .device(.passport), appearance: .darkAqua, name: "device-passport-setup-dark", setupMissing: true))
+        pages.append(Page(section: .general, appearance: .aqua, name: "general-setup-light", setupMissing: true))
         for page in pages {
+            model.showSampleSetup(accessibility: !page.setupMissing,
+                                  bluetooth: page.setupMissing ? .denied : .allowedAlways,
+                                  mic: page.setupMissing ? .notInstalled : .installed)
             let (section, theme, appearance, control, name, gestures) =
                 (page.section, page.theme, page.appearance, page.control, page.name, page.gestures)
             model.section = section
@@ -188,6 +196,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             (.connect(.au05), [], .aqua, "add-device-au05-light"),
             (.connect(.au05), [], .darkAqua, "add-device-au05-dark"),
             (.connect(.passport), [], .aqua, "add-device-passport-light"),
+            (.connect(.passport), [], .darkAqua, "add-device-passport-ready-dark"),
+            (.connect(.passport), [], .aqua, "add-device-passport-installing-light"),
         ]
         for (step, devices, appearance, name) in sheets {
             model.config.devices = devices
@@ -204,6 +214,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             }
             if name == "add-device-au05-light" {
                 model.update(status: nil, linkLost: false)
+            }
+            // 清单的几种样子：什么都没准备好 / 都好了 / 正在等蓝牙授权和安装驱动。
+            switch name {
+            case "add-device-passport-light", "add-device-au05-light":
+                model.showSampleSetup(accessibility: false, bluetooth: .allowedAlways, mic: .notInstalled)
+                if name == "add-device-passport-light" {
+                    model.updatePassport(DeviceSnapshot(link: .disconnected, note: "蓝牙已关闭", bluetooth: .off))
+                }
+            case "add-device-passport-installing-light":
+                model.showSampleSetup(accessibility: true, bluetooth: .notDetermined, mic: .notInstalled, busy: true)
+                model.updatePassport(DeviceSnapshot(link: .connecting))
+            default:
+                model.showSampleSetup(accessibility: true, bluetooth: .allowedAlways, mic: .installed)
             }
             let host = NSHostingController(rootView: AddDeviceSheet(model: model))
             let window = OffscreenWindow(contentViewController: host)
@@ -223,6 +246,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             print("wrote", url.path)
         }
         model.addDeviceStep = nil
+        PassportFirmwareSheet.snapshotAll(to: folder)
     }
 
     /// 显示 Dock 图标时屏幕顶部会出现本程序的菜单栏，给它最基本的菜单，⌘W / ⌘Q 才好用。

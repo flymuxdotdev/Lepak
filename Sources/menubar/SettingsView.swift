@@ -143,7 +143,7 @@ private struct Sidebar: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
         }
-        .frame(width: 204)
+        .frame(width: 232)
         .background(RoundedRectangle(cornerRadius: 20, style: .continuous).fill(Palette.sidebar))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(Palette.hairline))
     }
@@ -172,12 +172,17 @@ private struct NavItem: View {
                 Image(systemName: systemImage)
                     .font(.system(size: 15, weight: .medium))
                     .frame(width: 22)
-                Text(title)
-                    .font(.system(size: 15, weight: selected ? .semibold : .regular))
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if let status {
-                    Circle().fill(status).frame(width: 7, height: 7)
+                // 名字占满中间，圆点紧贴右边。像「FOLOTOY AI Passport」这样长的型号名先略微缩小字号，
+                // 还放不下（用户起的长名字）才截断。
+                HStack(spacing: 8) {
+                    Text(title)
+                        .font(.system(size: 15, weight: selected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let status {
+                        Circle().fill(status).frame(width: 7, height: 7)
+                    }
                 }
             }
             .foregroundStyle(selected ? Color.primary : Color.primary.opacity(0.72))
@@ -295,6 +300,13 @@ private struct HomePage: View {
             VStack(alignment: .leading, spacing: 28) {
                 Text("说话，不用打字")
                     .font(.system(size: 44, weight: .heavy))
+                // 已添加的设备还缺必需的权限：每项一条提醒，点了去系统设置。
+                let issues = model.setupIssues(for: model.config.devices)
+                if !issues.isEmpty {
+                    VStack(spacing: 8) {
+                        ForEach(issues) { SetupBanner(model: model, issue: $0) }
+                    }
+                }
                 InsightsSection(usage: model.usage, accent: Brand.accent, devices: model.config.devices,
                                 name: { model.displayName($0) },
                                 link: { model.snapshot(of: $0).link },
@@ -306,7 +318,11 @@ private struct HomePage: View {
             .padding(.top, 50)
             .padding(.bottom, 80)
         }
+        .onReceive(refresh) { _ in model.refreshPermissions() }
     }
+
+    /// 用户在系统设置里点了允许，提醒条要跟着消失。
+    private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 }
 
 private struct InsightsSection: View {
@@ -562,11 +578,11 @@ private struct DevicesCard: View {
         )
     }
 
-    /// 标题用用户起的名字，改过名的下面补一句型号。次数按使用记录里的设备名（型号名）查。
+    /// 标题用用户起的名字，改过名的下面补一句型号。次数按使用记录里的设备名（`usageName`，不一定等于型号名）查。
     private func row(_ kind: DeviceKind) -> some View {
         let device = kind.usageName
         let title = name(kind)
-        let detail = title == device ? lastUsed(device) : "\(device) · \(lastUsed(device))"
+        let detail = title == kind.name ? lastUsed(device) : "\(kind.name) · \(lastUsed(device))"
         return HStack(spacing: 12) {
             Image(systemName: kind.systemImage)
                 .font(.system(size: 15))
@@ -609,6 +625,8 @@ private struct DevicePage: View {
 
     /// AU05 跟着它的款式配色，别的设备用标准配色。
     private var theme: DeviceTheme { kind == .au05 ? model.theme : .standard }
+    /// 权限和驱动没有变化通知，页面开着时定时查一下。
+    private let refresh = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -620,8 +638,18 @@ private struct DevicePage: View {
                     .padding(.horizontal, 28)
                     .padding(.top, 16)
             }
+            ForEach(model.setupIssues(for: [kind])) { issue in
+                SetupBanner(model: model, issue: issue)
+                    .padding(.horizontal, 28)
+                    .padding(.top, 12)
+            }
+            if kind == .passport {
+                // USB 连着、蓝牙没连上时提示安装固件；自己带边距，不满足条件时不占地方。
+                PassportFirmwareBanner(connected: model.snapshot(of: kind).link == .connected, accent: theme.accent)
+            }
             KeysPage(model: model, ui: model.mappingUI, kind: kind)
         }
+        .onReceive(refresh) { _ in model.refreshPermissions() }
         // 设备页里的开关、选中状态用这台设备的主题色；窗口其他地方是固定的 `Brand.accent`。
         .tint(theme.accent)
         .toggleStyle(ThemedSwitch(accent: theme.accent))
@@ -647,6 +675,9 @@ private struct DevicePage: View {
                     ThemeSwitcher(selection: $model.config.deviceTheme)
                         .fixedSize()
                 }
+                if kind == .passport {
+                    PassportFirmwareBadge(accent: theme.accent)
+                }
                 HStack(spacing: 8) {
                     CircleIconButton(systemImage: "pencil", help: "重命名") { model.beginRename(kind) }
                     CircleIconButton(systemImage: "trash", help: "移除这台设备") { model.removingDevice = kind }
@@ -660,7 +691,25 @@ private struct DevicePage: View {
                     .lineLimit(1)
                 Spacer(minLength: 8)
                 if kind == .passport {
-                    MicBadge(status: model.passportMic)
+                    // 驱动没装或有新版本：直接给安装按钮；装好了显示麦克风状态。
+                    if model.micDriverBusy {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("正在安装 Lepak 麦克风…").font(.system(size: 13, weight: .medium))
+                        }
+                        .padding(.horizontal, 12)
+                        .frame(height: 30)
+                        .background(Capsule().fill(Palette.raised))
+                    } else if model.micDriverBundled, model.micDriver != .installed {
+                        Button(model.micDriver == .outdated ? "更新 Lepak 麦克风" : "安装 Lepak 麦克风") {
+                            model.installMicDriver()
+                        }
+                        .buttonStyle(PillButtonStyle(kind: .subtle, height: 30))
+                        .help(model.micDriverMessage
+                              ?? "装好后在 Typeless 里把麦克风选成「Lepak 麦克风」，就能对着 AI Passport 说话。要输入 Mac 的登录密码。")
+                    } else {
+                        MicBadge(status: model.passportMic)
+                    }
                 }
                 if !model.keysAreDefault(kind) {
                     Button("恢复默认") { model.resetKeys(kind) }
@@ -795,6 +844,43 @@ private struct UlanziBanner: View {
     }
 }
 
+/// 已添加的设备还缺的必需权限（`SetupIssue`），一条一个，样子和 Ulanzi Studio 的提醒条一样。
+private struct SetupBanner: View {
+    @ObservedObject var model: SettingsModel
+    let issue: SetupIssue
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(text)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button("去允许") { open() }
+                .buttonStyle(PillButtonStyle(kind: .accent(.orange), height: 28))
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.orange.opacity(0.12)))
+    }
+
+    private var text: String {
+        switch issue {
+        case .accessibility: return "还没允许「辅助功能」，设备上的键现在发不出去。"
+        case .bluetoothDenied: return "还没允许 Lepak 使用蓝牙，连不上 AI Passport。"
+        }
+    }
+
+    private func open() {
+        switch issue {
+        case .accessibility: model.openAccessibilitySettings()
+        case .bluetoothDenied: model.openBluetoothPrivacySettings()
+        }
+    }
+}
+
 // MARK: 添加设备（弹窗）
 
 /// 「添加设备」弹窗，两步：先选型号（已添加的灰掉），再看着实时状态把它连上，点「完成」才加进「我的设备」。
@@ -802,6 +888,8 @@ private struct UlanziBanner: View {
 /// 以后支持的设备加在 `DeviceKind` 里，第一步自动多一张卡。
 struct AddDeviceSheet: View {
     @ObservedObject var model: SettingsModel
+    /// 辅助功能、蓝牙权限、驱动都没有变化通知，弹窗开着时每秒查一次，用户在系统设置里点了允许，这里马上打勾。
+    private let refresh = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     static let width: CGFloat = 620
 
@@ -916,29 +1004,28 @@ struct AddDeviceSheet: View {
                 Text("连接 \(kind.name)").font(.system(size: 24, weight: .bold))
             }
             .padding(.bottom, 20)
+            // 清单：连接、（蓝牙）、辅助功能、（Lepak 麦克风）。每项实时更新，缺什么就在那一行给按钮。
             HStack(alignment: .top, spacing: 22) {
                 thumbnail(kind, height: 150)
                     .frame(width: 112, height: 168)
-                VStack(alignment: .leading, spacing: 16) {
-                    status(kind)
-                    VStack(alignment: .leading, spacing: 10) {
-                        ForEach(Array(Self.steps(kind).enumerated()), id: \.offset) { index, step in
-                            HStack(alignment: .firstTextBaseline, spacing: 10) {
-                                Text("\(index + 1)")
-                                    .font(.system(size: 12, weight: .bold))
-                                    .frame(width: 22, height: 22)
-                                    .background(Circle().fill(Palette.raised))
-                                Text(step)
-                                    .font(.system(size: 14))
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-                        }
+                VStack(alignment: .leading, spacing: 0) {
+                    connectionRow(kind)
+                    if kind == .passport {
+                        RowDivider()
+                        bluetoothRow
+                    }
+                    RowDivider()
+                    accessibilityRow
+                    if kind == .passport {
+                        RowDivider()
+                        micRow
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .card(padding: 20, radius: 18)
+            .onAppear { model.refreshPermissions() }
+            .onReceive(refresh) { _ in model.refreshPermissions() }
             if kind == .au05, model.ulanziRunning {
                 UlanziBanner(model: model)
                     .padding(.top, 12)
@@ -946,9 +1033,7 @@ struct AddDeviceSheet: View {
             nameField(kind)
                 .padding(.top, 16)
             HStack(spacing: 10) {
-                Note(model.snapshot(of: kind).link == .connected
-                     ? "已经连上了，点「完成」把它加进「我的设备」。"
-                     : "还没连上也可以先点「完成」，设备开机后会自动连上。")
+                Note(footerNote(kind))
                 Spacer(minLength: 12)
                 Button("取消") { model.cancelAddDevice() }
                     .buttonStyle(PillButtonStyle(kind: .subtle, height: 34))
@@ -977,32 +1062,95 @@ struct AddDeviceSheet: View {
         }
     }
 
-    /// 实时连接状态：连上了是绿点和电量，没连上是转圈；蓝牙关着这类原因用橙色感叹号写出来。
-    private func status(_ kind: DeviceKind) -> some View {
+    // MARK: 清单的每一行
+
+    /// 连接：连上了打勾、显示电量；没连上一直转圈，下面写怎么让它连上。蓝牙的问题在蓝牙那行说。
+    private func connectionRow(_ kind: DeviceKind) -> some View {
         let device = model.snapshot(of: kind)
-        let connected = device.link == .connected
-        return HStack(spacing: 8) {
-            if connected {
-                Circle().fill(Color.green).frame(width: 8, height: 8)
-            } else if device.note != nil {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.orange)
-            } else {
-                ProgressView().controlSize(.small)
-            }
-            Text(statusText(device)).font(.system(size: 14, weight: .medium))
+        if device.link == .connected {
+            return SetupRow(mark: .done, title: "设备已连接",
+                            detail: device.percent.map { "电量 \($0)%。" } ?? "可以用了。") { EmptyView() }
         }
-        .padding(.horizontal, 12)
-        .frame(height: 32)
-        .background(Capsule().fill(Palette.raised))
+        return SetupRow(mark: .waiting, title: "正在寻找设备…", detail: Self.connectHint(kind)) { EmptyView() }
     }
 
-    private func statusText(_ device: DeviceSnapshot) -> String {
-        if device.link == .connected {
-            return device.percent.map { "已连接 · 电量 \($0)%" } ?? "已连接"
+    /// 蓝牙（只有 AI Passport）：先看蓝牙本身能不能用，再看有没有允许 Lepak 用。
+    @ViewBuilder private var bluetoothRow: some View {
+        let issue = model.passport.bluetooth
+        let authorization = model.bluetoothAuthorization
+        if issue == .denied || authorization == .denied || authorization == .restricted {
+            SetupRow(mark: .action, title: "允许使用蓝牙",
+                     detail: "在系统设置里打开 Lepak 的蓝牙权限，才能连上 AI Passport。") {
+                actionButton("去允许") { model.openBluetoothPrivacySettings() }
+            }
+        } else if issue == .unsupported {
+            SetupRow(mark: .action, title: "这台 Mac 不支持低功耗蓝牙",
+                     detail: "AI Passport 要用低功耗蓝牙连接。") { EmptyView() }
+        } else if issue == .off {
+            SetupRow(mark: .action, title: "打开蓝牙", detail: "Mac 的蓝牙现在关着。") {
+                actionButton("打开蓝牙设置") { model.openBluetoothSettings() }
+            }
+        } else if authorization == .notDetermined {
+            SetupRow(mark: .waiting, title: "允许使用蓝牙",
+                     detail: "系统会弹出提示，问能不能让 Lepak 使用蓝牙，点「允许」。") { EmptyView() }
+        } else {
+            SetupRow(mark: .done, title: "已允许使用蓝牙", detail: "用来连接 AI Passport，接收按键和声音。") { EmptyView() }
         }
-        return device.note ?? "正在寻找设备…"
+    }
+
+    @ViewBuilder private var accessibilityRow: some View {
+        if model.accessibilityTrusted {
+            SetupRow(mark: .done, title: "已允许辅助功能", detail: "用来发出 Fn、回车等按键。") { EmptyView() }
+        } else {
+            SetupRow(mark: .action, title: "允许辅助功能",
+                     detail: "用来发出 Fn、回车等按键。不允许的话，设备上的键都不起作用。") {
+                actionButton("去允许") { model.openAccessibilitySettings() }
+            }
+        }
+    }
+
+    /// Lepak 麦克风（只有 AI Passport，推荐但可以不装）：一键安装，要输入管理员密码。
+    @ViewBuilder private var micRow: some View {
+        if model.micDriverBusy {
+            SetupRow(mark: .waiting, title: "正在安装 Lepak 麦克风…", tag: "推荐",
+                     detail: "在弹出的窗口里输入 Mac 的登录密码。") { EmptyView() }
+        } else {
+            switch model.micDriver {
+            case .installed:
+                SetupRow(mark: .done, title: "Lepak 麦克风已安装",
+                         detail: "在 Typeless 里把麦克风选成「Lepak 麦克风」，就能对着设备说话。") { EmptyView() }
+            case .outdated:
+                SetupRow(mark: .action, title: "更新 Lepak 麦克风", tag: "推荐",
+                         detail: model.micDriverMessage ?? "有新版本的驱动。要输入 Mac 的登录密码，声音会中断一两秒。") {
+                    actionButton("更新") { model.installMicDriver() }
+                }
+            case .notInstalled:
+                SetupRow(mark: .optional, title: "安装 Lepak 麦克风", tag: "推荐",
+                         detail: model.micDriverMessage ?? (model.micDriverBundled
+                            ? "装好后就能对着设备说话。不装也能用按键，说话用 Mac 自带的麦克风。安装要输入 Mac 的登录密码。"
+                            : "开发版没有带驱动，用 scripts/install-mic-driver.sh 安装。")) {
+                    if model.micDriverBundled {
+                        actionButton("安装") { model.installMicDriver() }
+                    }
+                }
+            }
+        }
+    }
+
+    private func actionButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action)
+            .buttonStyle(PillButtonStyle(kind: .accent(Brand.accent), height: 28))
+            .fixedSize()
+    }
+
+    private func footerNote(_ kind: DeviceKind) -> String {
+        if model.snapshot(of: kind).link != .connected {
+            return "还没连上也可以先点「完成」，设备开机后会自动连上。"
+        }
+        if !model.setupIssues(for: [kind]).isEmpty {
+            return "还有没准备好的，可以先点「完成」，首页会提醒你。"
+        }
+        return "都准备好了，点「完成」把它加进「我的设备」。"
     }
 
     private func thumbnail(_ kind: DeviceKind, height: CGFloat) -> some View {
@@ -1015,21 +1163,64 @@ struct AddDeviceSheet: View {
         }
     }
 
-    private static func steps(_ kind: DeviceKind) -> [String] {
+    /// 没连上时，连接那一行下面的说明。
+    private static func connectHint(_ kind: DeviceKind) -> String {
         switch kind {
         case .au05:
-            return [
-                "插上 AU05 的 USB 接收器，打开 AU05。",
-                "如果装了 Ulanzi Studio，先退出它，免得两边同时接管 AU05。",
-                "上面显示「已连接」，就是连上了。",
-            ]
+            return "插上 USB 接收器，打开 AU05。装了 Ulanzi Studio 的话先退出它，免得两边同时接管。"
         case .passport:
-            return [
-                "先给 AI Passport 刷上社区固件（InputBetter 或 FoloVibe Key）。出厂的官方固件连不上 Lepak。",
-                "打开 Mac 的蓝牙，给 AI Passport 开机。Lepak 会自己找到它并连上，第一次会问能不能使用蓝牙，点允许。",
-                "如果开着 InputBetter 或 FoloVibe Key 的 App，先退出它：一台设备同时只能连一个程序。",
-                "上面显示「已连接」，就是连上了。屏幕上会显示三个键现在发什么。",
-            ]
+            // 出厂固件连不上，要先装社区固件：设备页的「固件」能用 USB-C 一键装（见 PassportFirmwareView）。
+            return "刷过社区固件的，开机后会自动连上；开着 InputBetter 或 FoloVibe Key 的 App 的话先退出。出厂固件连不上 Lepak：先点「完成」，再到设备页点「固件」，用 USB-C 线一键安装。"
+        }
+    }
+}
+
+/// 「添加设备」清单里的一行：左边是状态（打勾、转圈、橙色感叹号、虚线圈表示可选），中间标题和说明，右边是要用户点的按钮。
+private struct SetupRow<Trailing: View>: View {
+    enum Mark { case done, waiting, action, optional }
+
+    let mark: Mark
+    let title: String
+    var tag: String? = nil
+    let detail: String
+    @ViewBuilder let trailing: () -> Trailing
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            icon.frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(title).font(.system(size: 14, weight: .semibold))
+                    if let tag {
+                        Text(tag)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Brand.accent)
+                            .padding(.horizontal, 6)
+                            .frame(height: 18)
+                            .background(Capsule().fill(Brand.accent.opacity(0.12)))
+                    }
+                }
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder private var icon: some View {
+        switch mark {
+        case .done:
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 17)).foregroundStyle(.green)
+        case .waiting:
+            ProgressView().controlSize(.small)
+        case .action:
+            Image(systemName: "exclamationmark.circle.fill").font(.system(size: 17)).foregroundStyle(.orange)
+        case .optional:
+            Image(systemName: "circle.dashed").font(.system(size: 17)).foregroundStyle(.secondary)
         }
     }
 }
@@ -1075,10 +1266,22 @@ private struct GeneralPage: View {
                         }
                     }
                 }
-                group("权限") {
+                group("权限和驱动") {
                     SettingRow(title: "辅助功能（必需）",
-                               detail: "用来发出 Fn、回车、方向键等按键，并判断光标是不是在输入框里。不开启的话 AU05 的按键都不起作用。") {
+                               detail: "用来发出 Fn、回车、方向键等按键，并判断光标是不是在输入框里。不开启的话设备上的键都不起作用。") {
                         permission(model.accessibilityTrusted, kind: .accent(accent), open: model.openAccessibilitySettings)
+                    }
+                    if model.isAdded(.passport) {
+                        RowDivider()
+                        SettingRow(title: "蓝牙", detail: "用来连接 AI Passport，接收按键和声音。") {
+                            bluetoothPermission(accent: accent)
+                        }
+                    }
+                    RowDivider()
+                    SettingRow(title: "Lepak 麦克风",
+                               detail: model.micDriverMessage
+                                ?? "让 AI Passport 当麦克风用：装好后在 Typeless 里把麦克风选成「Lepak 麦克风」。安装和卸载都要输入 Mac 的登录密码，声音会中断一两秒。") {
+                        micDriverControl(accent: accent)
                     }
                 }
                 group("关于") {
@@ -1137,6 +1340,51 @@ private struct GeneralPage: View {
                 .padding(.horizontal, 22)
                 .padding(.vertical, 4)
                 .card(padding: 0)
+        }
+    }
+
+    /// 蓝牙：没问过的时候不算没允许（第一次连 AI Passport 时系统会问）。
+    @ViewBuilder private func bluetoothPermission(accent: Color) -> some View {
+        switch model.bluetoothAuthorization {
+        case .allowedAlways:
+            permission(true, kind: .accent(accent)) {}
+        case .notDetermined:
+            Text("连接时会问").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+        default:
+            permission(false, kind: .accent(accent), open: model.openBluetoothPrivacySettings)
+        }
+    }
+
+    /// Lepak 麦克风驱动：安装 / 更新 / 卸载。安装中转圈（在等管理员密码）。
+    @ViewBuilder private func micDriverControl(accent: Color) -> some View {
+        if model.micDriverBusy {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("请稍候…").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+            }
+        } else {
+            HStack(spacing: 10) {
+                switch model.micDriver {
+                case .installed:
+                    Label("已安装", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.green)
+                case .outdated:
+                    Button("更新") { model.installMicDriver() }
+                        .buttonStyle(PillButtonStyle(kind: .accent(accent), height: 30))
+                case .notInstalled:
+                    if model.micDriverBundled {
+                        Button("安装") { model.installMicDriver() }
+                            .buttonStyle(PillButtonStyle(kind: .accent(accent), height: 30))
+                    } else {
+                        Text("开发版没有带驱动").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
+                    }
+                }
+                if model.micDriver != .notInstalled {
+                    Button("卸载") { model.uninstallMicDriver() }
+                        .buttonStyle(PillButtonStyle(kind: .subtle, height: 30))
+                }
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import AuthenticationServices
+import CoreBluetooth
 import ServiceManagement
 import SwiftUI
 import LepakKit
@@ -18,7 +19,7 @@ enum DeviceKind: String, CaseIterable, Codable, Identifiable, Sendable {
     var name: String {
         switch self {
         case .au05: return "Ulanzi AU05"
-        case .passport: return "AI Passport"
+        case .passport: return "FOLOTOY AI Passport"
         }
     }
 
@@ -106,6 +107,20 @@ struct DeviceSnapshot: Equatable {
     var charging = false
     /// 没连上时补一句原因，比如「蓝牙已关闭」；nil 就只显示连接状态。
     var note: String?
+    /// 蓝牙设备（AI Passport）因为蓝牙本身连不上：关着、没允许、不支持。「添加设备」清单按它给出对应的按钮。
+    var bluetooth: BluetoothIssue?
+}
+
+enum BluetoothIssue: Equatable {
+    case off, denied, unsupported
+}
+
+/// 已添加的设备还缺的必需条件，首页和设备页顶上提醒。Lepak 麦克风是可选的，不算在这里。
+enum SetupIssue: Hashable, Identifiable {
+    case accessibility
+    case bluetoothDenied
+
+    var id: Self { self }
 }
 
 /// 设置窗口和菜单共用的状态。只在主线程使用。
@@ -162,6 +177,15 @@ final class SettingsModel: ObservableObject {
     /// Lepak 麦克风（AI Passport 当麦克风用）的状态。
     @Published private(set) var passportMic = PassportMic.Status.notInstalled
     @Published private(set) var accessibilityTrusted = AXIsProcessTrusted()
+    /// 蓝牙权限。第一次连 AI Passport 时系统会弹窗问，之前是 notDetermined。
+    @Published private(set) var bluetoothAuthorization = CBManager.authorization
+    /// Lepak 麦克风驱动装没装（看文件）；`micDriverBusy` 是正在安装或卸载（在等管理员密码）。
+    @Published private(set) var micDriver = MicDriver.state()
+    @Published private(set) var micDriverBusy = false
+    /// 上次安装或卸载失败的原因。
+    @Published private(set) var micDriverMessage: String?
+    /// 这个版本带没带驱动（直接 swift build 的开发版没有）。
+    let micDriverBundled = MicDriver.bundledURL != nil
     @Published private(set) var ulanziRunning = false
     @Published private(set) var launchAtLogin = false
     @Published private(set) var loginItemMessage: String?
@@ -368,8 +392,67 @@ final class SettingsModel: ObservableObject {
         passport = DeviceSnapshot(link: .connected, percent: 87, millivolts: 4012, charging: false)
     }
 
+    /// 辅助功能、蓝牙权限和麦克风驱动都没有变化通知，设置页和「添加设备」弹窗开着时定时查一下。
     func refreshPermissions() {
+        guard !sampleSetup else { return }
         accessibilityTrusted = AXIsProcessTrusted()
+        bluetoothAuthorization = CBManager.authorization
+        if !micDriverBusy {
+            micDriver = MicDriver.state()
+        }
+    }
+
+    /// 这几台设备还缺的必需条件。没添加设备时什么都不缺（还用不上）。
+    func setupIssues(for kinds: [DeviceKind]) -> [SetupIssue] {
+        guard !kinds.isEmpty else { return [] }
+        var issues: [SetupIssue] = []
+        if !accessibilityTrusted {
+            issues.append(.accessibility)
+        }
+        if kinds.contains(.passport),
+           bluetoothAuthorization == .denied || bluetoothAuthorization == .restricted || passport.bluetooth == .denied {
+            issues.append(.bluetoothDenied)
+        }
+        return issues
+    }
+
+    func installMicDriver() {
+        runMicDriver(MicDriver.install)
+    }
+
+    func uninstallMicDriver() {
+        runMicDriver(MicDriver.uninstall)
+    }
+
+    private func runMicDriver(_ action: (@escaping @Sendable (MicDriver.Outcome) -> Void) -> Void) {
+        guard !micDriverBusy else { return }
+        micDriverBusy = true
+        micDriverMessage = nil
+        action { outcome in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                micDriverBusy = false
+                micDriver = MicDriver.state()
+                switch outcome {
+                case .done, .canceled:
+                    micDriverMessage = nil
+                case .failed(let message):
+                    micDriverMessage = "没有成功：\(message)"
+                    DebugLog.write("Lepak 麦克风驱动：\(message)")
+                }
+            }
+        }
+    }
+
+    /// 开发截图用：固定一组准备状态，不再从系统读。
+    private var sampleSetup = false
+
+    func showSampleSetup(accessibility: Bool, bluetooth: CBManagerAuthorization, mic: MicDriver.State, busy: Bool = false) {
+        sampleSetup = true
+        accessibilityTrusted = accessibility
+        bluetoothAuthorization = bluetooth
+        micDriver = mic
+        micDriverBusy = busy
     }
 
     func refreshUlanzi() {
@@ -437,6 +520,17 @@ final class SettingsModel: ObservableObject {
     func openAccessibilitySettings() {
         FunctionKey.requestTrust()
         openPrivacyPane("Privacy_Accessibility")
+    }
+
+    func openBluetoothPrivacySettings() {
+        openPrivacyPane("Privacy_Bluetooth")
+    }
+
+    /// 蓝牙关着：打开「系统设置 → 蓝牙」。
+    func openBluetoothSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func openLoginItemsSettings() {

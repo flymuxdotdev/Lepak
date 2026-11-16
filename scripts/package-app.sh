@@ -10,6 +10,15 @@ cp "$BIN" "$APP/Contents/MacOS/Lepak"
 cp Support/Info.plist "$APP/Contents/Info.plist"
 cp Support/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp Support/DeviceArt.png Support/DeviceArtWorkBuddy.png "$APP/Contents/Resources/"
+# Lepak 麦克风驱动跟着 App 走，设置里点「安装」时由 Lepak 复制到 /Library/Audio/Plug-Ins/HAL（见 MicDriver.swift）。
+./scripts/build-mic-driver.sh >/dev/null
+mkdir -p "$APP/Contents/PlugIns"
+cp -R dist/LepakMic.driver "$APP/Contents/PlugIns/"
+# 给 AI Passport 装固件用的 esptool（乐鑫官方独立版，自带乐鑫的签名，不重新签），见 PassportFirmware.swift。
+ESPTOOL_DIR="$(./scripts/fetch-esptool.sh)"
+mkdir -p "$APP/Contents/Helpers" "$APP/Contents/Resources/Licenses"
+cp "$ESPTOOL_DIR/esptool" "$APP/Contents/Helpers/esptool"
+cp "$ESPTOOL_DIR/LICENSE" "$APP/Contents/Resources/Licenses/esptool-LICENSE.txt"
 xattr -cr "$APP"
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
 
@@ -49,6 +58,8 @@ if [[ -n "${LEPAK_SIGN_IDENTITY:-}" && -n "${LEPAK_PROFILE:-}" ]]; then
 </plist>
 EOF
     cp "$LEPAK_PROFILE" "$APP/Contents/embedded.provisionprofile"
+    # 里面的驱动先用同一个证书签好，外面的 App 签名才认它。
+    codesign --force --options runtime --sign "$LEPAK_SIGN_IDENTITY" "$APP/Contents/PlugIns/LepakMic.driver"
     codesign --force --options runtime --entitlements "$ENTITLEMENTS" --sign "$LEPAK_SIGN_IDENTITY" "$APP"
 else
     # 临时签名默认按二进制哈希认 App，每次重建辅助功能/输入监控权限都会失效。

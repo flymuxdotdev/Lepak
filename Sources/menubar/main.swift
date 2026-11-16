@@ -90,13 +90,18 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.settings.usage = Usage.summarize(data)
             }
         }
-        FunctionKey.requestTrust()
+        // 启动时不弹「辅助功能」授权：用户还不知道 Lepak 要它干什么。在「添加设备」的清单里说明白了再请求。
         FunctionKey.reset()
         // 只连用户在「我的设备」里添加过的（加上「添加设备」弹窗里正在试连的那台）。
         settings.onActiveDevicesChange = { [weak self] active in
             self?.connect(active)
         }
         connect(settings.activeDevices)
+        // 还没添加设备（第一次用，或者都移除了）：什么都不会工作，直接打开窗口进「添加设备」引导。
+        if settings.config.devices.isEmpty {
+            settingsWindow.show(section: .home)
+            settings.beginAddDevice()
+        }
         log(FunctionKey.isTrusted ? "语音键发送 Fn" : "辅助功能未允许")
         // 心跳要跟官方 Ulanzi Studio 一样每 1 秒一次。AU05 大约 3 秒收不到心跳，
         // 就认为电脑上没有配套程序，这时按语音键会从它自己的键盘口发出 Win+H
@@ -257,7 +262,8 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-        if !FunctionKey.isTrusted {
+        // 还没添加设备时用不上辅助功能，不提醒。
+        if !FunctionKey.isTrusted, !devices.isEmpty {
             let item = menu.addItem(withTitle: "⚠️ 辅助功能未允许，按键发不出去…", action: #selector(openPermissions), keyEquivalent: "")
             item.target = self
         }
@@ -362,6 +368,9 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         passport.onNote = { [weak self] line in
             Task { @MainActor in self?.log(line) }
         }
+        passport.onFirmware = { version, build in
+            Task { @MainActor in PassportFirmwareModel.shared.deviceReported(version: version, build: build) }
+        }
         updatePassportKeys()
         // 改了按键设置，屏幕上三个键旁边的提示马上跟着变。
         configObserver = NotificationCenter.default.addObserver(forName: Config.didChange, object: nil, queue: .main) { [weak self] _ in
@@ -389,10 +398,13 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             break
         case .bluetoothOff:
             snapshot.note = "蓝牙已关闭"
+            snapshot.bluetooth = .off
         case .unauthorized:
             snapshot.note = "没有允许 Lepak 使用蓝牙"
+            snapshot.bluetooth = .denied
         case .unsupported:
             snapshot.note = "这台 Mac 不支持低功耗蓝牙"
+            snapshot.bluetooth = .unsupported
         }
         if snapshot != settings.passport {
             settings.updatePassport(snapshot)

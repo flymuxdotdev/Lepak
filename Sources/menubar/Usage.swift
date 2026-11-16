@@ -30,7 +30,8 @@ struct UsageSummary: Equatable {
 
 final class Usage: @unchecked Sendable {
     static let shared = Usage()
-    /// 每台设备用各自的名字记，首页按设备分开显示。
+    /// 每台设备用各自的名字记，首页按设备分开显示。这是 usage.json 里的键，不跟着界面上的型号名改，
+    /// 改了以前的次数就对不上了（界面上显示的是 `DeviceKind.name`）。
     static let au05 = "Ulanzi AU05"
     static let passport = "AI Passport"
 

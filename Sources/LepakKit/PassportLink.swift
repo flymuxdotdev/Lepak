@@ -48,6 +48,8 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     /// 键按下（true）或松开（false）。断线时还按着的键会补一个松开。
     public var onButton: ((PassportButton, Bool) -> Void)?
     public var onNote: ((String) -> Void)?
+    /// 每次握手报一次设备上的固件版本（`0.1.3`）和构建标识（固件文件哈希的前 8 位，老固件可能没有）。
+    public var onFirmware: ((_ version: String, _ build: String?) -> Void)?
     /// 开麦后设备传来的声音：16 kHz 单声道，-1…1（每 20 毫秒一次）。
     public var onAudio: (([Float]) -> Void)?
 
@@ -227,6 +229,7 @@ public final class PassportLink: NSObject, @unchecked Sendable {
             online = true
             if firstTime { note("握手成功：固件 \(firmware) \(version)") }
             setState(.online(firmware: version))
+            onFirmware?(version, object["build"] as? String)
             sendConfig()
             sendMicState()
             sendKeys()
