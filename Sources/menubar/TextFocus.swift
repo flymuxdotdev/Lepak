@@ -52,9 +52,15 @@ enum TextFocus {
         let name = appName(app) + fallback
 
         let focusResult = copyElement(app, kAXFocusedUIElementAttribute)
-        var focusedElement = focusResult.0
+        var focusedElement: AXUIElement? = focusResult.0
         var focusError = focusResult.1
-        if focusedElement.map({ !textRoles.contains(role(of: $0)) }) ?? true, enableAccessibilityTree(of: app) {
+        let needsEnableTree: Bool
+        if let current = focusedElement {
+            needsEnableTree = !textRoles.contains(Self.role(of: current))
+        } else {
+            needsEnableTree = true
+        }
+        if needsEnableTree && enableAccessibilityTree(of: app) {
             // Electron / Chromium 默认不开放辅助功能树，打开后再取一次。
             let retry = copyElement(app, kAXFocusedUIElementAttribute)
             focusedElement = retry.0
@@ -63,15 +69,15 @@ enum TextFocus {
         guard let focused = focusedElement else {
             return Decision(moveCaret: false, reason: "\(name) 没有焦点控件，错误 \(focusError.rawValue)")
         }
-        let role = role(of: focused)
-        guard textRoles.contains(role) else {
-            return Decision(moveCaret: false, reason: "\(name) 焦点在 \(role)")
+        let elementRole = Self.role(of: focused)
+        guard textRoles.contains(elementRole) else {
+            return Decision(moveCaret: false, reason: "\(name) 焦点在 \(elementRole)")
         }
         let valueSettable = settable(focused, kAXValueAttribute)
         let rangeSettable = settable(focused, kAXSelectedTextRangeAttribute)
-        let detail = "\(name) \(role) 值可写:\(valueSettable ? "是" : "否") 选区可写:\(rangeSettable ? "是" : "否")"
+        let detail = "\(name) \(elementRole) 值可写:\(valueSettable ? "是" : "否") 选区可写:\(rangeSettable ? "是" : "否")"
         // 文本框、搜索框本身就是输入控件；文本区可能只读（比如日志窗口），要能写才算输入框。
-        guard role != kAXTextAreaRole as String || valueSettable || rangeSettable else {
+        guard elementRole != kAXTextAreaRole as String || valueSettable || rangeSettable else {
             return Decision(moveCaret: false, reason: "只读 \(detail)")
         }
         guard let frame = frame(of: focused) else {
