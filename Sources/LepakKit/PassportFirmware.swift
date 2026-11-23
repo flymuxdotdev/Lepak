@@ -2,19 +2,20 @@ import CryptoKit
 import Foundation
 import IOKit
 
-/// 给 AI Passport 装社区固件（InputBetter，协议 v1）：从官网的固件清单下载、校验，再用 esptool 通过 USB 写进设备。
+/// 给 AI Passport 装 Lepak 自己的固件（带蓝牙配对保护，协议 v1），再用 esptool 通过 USB 写进设备。
+/// 固件跟着 App 发布：scripts/release-passport-firmware.sh 生成清单和镜像，package-app.sh 拷进 Contents/Resources/Firmware。不联网。
 ///
 /// 安全约束（和社区项目的刷写脚本、网页刷写一致）：
 /// - 只写 bootloader（0x0）、分区表（0x8000）、应用（0x10000）三段，不擦除整片 Flash，从不写 `cardid` 分区
 ///   （0x356000，设备出厂身份数据）。清单里的地址、大小和要写的新分区表都先检查，对不上就不装。
+///   NVS 不动，所以设备记住的配对（哪几台 Mac）重装后还在。
+/// - 只装带配对保护的固件（清单里 `pair` 为 1），不会把设备换成谁都能连的固件。
 /// - 写之前确认设备是 ESP32-C3、8 MB Flash，并且设备现在的分区表里有 `cardid`（是 AI Passport，不是别的开发板）。
 /// - 每台设备（按 MAC）第一次装之前，把整片 8 MB Flash 备份到本机，可用来恢复原来的固件。备份里有设备身份数据，不外传。
 /// - 只用乐鑫芯片的 USB 串口（VID 0x303A），不碰键盘，不需要「输入监控」。
 ///
 /// esptool 是乐鑫官方的独立版（GPL-2.0），作为单独的程序调用，跟着 App 放在 Contents/Helpers（见 scripts/fetch-esptool.sh）。
 public enum PassportFirmware {
-    /// InputBetter 官网的固件清单（社区项目 scripts/package-firmware.sh 生成）。
-    public static let manifestURL = URL(string: "https://input.0os.io/firmware/manifest.json")!
     /// Lepak 只认协议 v1，清单里的 `proto` 不是 1 就不装。
     public static let protocolVersion = 1
 
@@ -47,8 +48,9 @@ public enum PassportFirmware {
             self.images = images
         }
 
-        /// 解析并检查清单。协议版本不对时抛 `.incompatible`，其他不对劲的地方抛 `.badManifest`。
-        public static func parse(_ data: Data, base: URL) throws -> Manifest {
+        /// 解析并检查清单。镜像路径相对清单所在的文件夹，只能指向这个文件夹里的文件。
+        /// 协议版本不对时抛 `.incompatible`，没有配对保护抛 `.unprotected`，其他不对劲的地方抛 `.badManifest`。
+        public static func parse(_ data: Data, folder: URL) throws -> Manifest {
             guard data.count < 64 * 1024,
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw FirmwareError.badManifest("不是有效的清单")
@@ -60,19 +62,23 @@ public enum PassportFirmware {
             guard (object["proto"] as? Int) == PassportFirmware.protocolVersion else {
                 throw FirmwareError.incompatible(version: version)
             }
+            guard (object["pair"] as? Int) == 1 else {
+                throw FirmwareError.unprotected
+            }
             guard (object["chip"] as? String) == "ESP32-C3", (object["flashSize"] as? String) == "8MB" else {
                 throw FirmwareError.badManifest("芯片型号不对")
             }
             guard let list = object["images"] as? [[String: Any]], list.count == 3 else {
                 throw FirmwareError.badManifest("镜像数量不对")
             }
+            let root = folder.standardizedFileURL.path
             var images: [Image] = []
             for entry in list {
                 guard let offsetText = entry["offset"] as? String, offsetText.hasPrefix("0x"),
                       let offset = UInt32(offsetText.dropFirst(2), radix: 16),
                       let path = entry["path"] as? String, Self.isRelativePath(path),
-                      let url = URL(string: path, relativeTo: base)?.absoluteURL,
-                      url.scheme == "https", url.host == base.host,
+                      case let url = folder.appendingPathComponent(path).standardizedFileURL,
+                      url.isFileURL, url.path.hasPrefix(root + "/"),
                       let size = entry["size"] as? Int, size > 0,
                       let sha = entry["sha256"] as? String, sha.count == 64,
                       sha.allSatisfy({ $0.isHexDigit && !$0.isUppercase })
@@ -100,7 +106,7 @@ public enum PassportFirmware {
             }
         }
 
-        /// 只接受 `0.1.3-4d1c6c61/app.bin` 这样的相对路径：没有 `..`，不能跳到别的网站。
+        /// 只接受 `app.bin`、`1.0.0/app.bin` 这样的相对路径：没有 `..`，不能跳出清单所在的文件夹。
         static func isRelativePath(_ path: String) -> Bool {
             let parts = path.split(separator: "/", omittingEmptySubsequences: false)
             return !parts.isEmpty && parts.count <= 4 && parts.allSatisfy { part in
@@ -122,37 +128,18 @@ public enum PassportFirmware {
         return false
     }
 
-    private static let session: URLSession = {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.httpCookieAcceptPolicy = .never
-        configuration.httpShouldSetCookies = false
-        configuration.urlCache = nil
-        configuration.timeoutIntervalForRequest = 20
-        return URLSession(configuration: configuration)
-    }()
-
-    /// 从官网取最新的固件清单（不下载镜像）。
-    public static func fetchManifest() async throws -> Manifest {
-        let request = URLRequest(url: manifestURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            throw FirmwareError.network(error.localizedDescription)
+    /// 读出文件夹里的固件清单（App 里是 Contents/Resources/Firmware）。
+    public static func manifest(in folder: URL) throws -> Manifest {
+        guard let data = try? Data(contentsOf: folder.appendingPathComponent("manifest.json")) else {
+            throw FirmwareError.missing
         }
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw FirmwareError.network("服务器返回 \((response as? HTTPURLResponse)?.statusCode ?? 0)")
-        }
-        return try Manifest.parse(data, base: manifestURL)
+        return try Manifest.parse(data, folder: folder)
     }
 
-    // MARK: 下载
+    // MARK: 准备镜像
 
-    /// 下载好、校验过的一套镜像，放在临时文件夹里。用完调用 `discard()`。
-    public struct Download: Sendable {
+    /// 校验过的一套镜像，复制在临时文件夹里（esptool 写的是这些副本）。用完调用 `discard()`。
+    public struct Prepared: Sendable {
         public let manifest: Manifest
         let files: [(offset: UInt32, file: URL)]
         let folder: URL
@@ -162,29 +149,15 @@ public enum PassportFirmware {
         }
     }
 
-    /// 下载清单里的三段镜像，逐个核对大小和 SHA-256，并检查要写的新分区表。`progress` 收到 0…1。
-    public static func download(_ manifest: Manifest, progress: @escaping @Sendable (Double) -> Void) async throws -> Download {
+    /// 读出清单里的三段镜像，逐个核对大小和 SHA-256，检查要写的新分区表，再复制到临时文件夹。
+    public static func prepare(_ manifest: Manifest) throws -> Prepared {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("LepakFirmware-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         do {
-            let total = Double(manifest.images.reduce(0) { $0 + $1.size })
-            var done = 0
             var files: [(offset: UInt32, file: URL)] = []
             for image in manifest.images {
-                try Task.checkCancellation()
-                let data: Data
-                let response: URLResponse
-                do {
-                    (data, response) = try await session.data(from: image.url)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    throw FirmwareError.network(error.localizedDescription)
-                }
-                guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                    throw FirmwareError.network("服务器返回 \((response as? HTTPURLResponse)?.statusCode ?? 0)")
-                }
+                guard let data = try? Data(contentsOf: image.url) else { throw FirmwareError.missing }
                 guard data.count == image.size, sha256(data) == image.sha256 else {
                     throw FirmwareError.checksum
                 }
@@ -197,10 +170,8 @@ public enum PassportFirmware {
                 let file = folder.appendingPathComponent(String(format: "0x%05x.bin", image.offset))
                 try data.write(to: file)
                 files.append((image.offset, file))
-                done += image.size
-                progress(Double(done) / max(total, 1))
             }
-            return Download(manifest: manifest, files: files, folder: folder)
+            return Prepared(manifest: manifest, files: files, folder: folder)
         } catch {
             try? FileManager.default.removeItem(at: folder)
             throw error
@@ -262,7 +233,7 @@ public enum PassportFirmware {
     /// 把下载好的固件写进 USB 上的设备。写完设备自己重启，进入新固件。
     /// 写入开始之前可以取消（取消会让设备重启回原来的固件）；开始写之后不要取消。
     public static func install(
-        _ firmware: Download,
+        _ firmware: Prepared,
         port: String,
         esptool: Esptool,
         backupFolder: URL,
@@ -353,9 +324,10 @@ public enum PassportFirmware {
 // MARK: 错误
 
 public enum FirmwareError: Error, LocalizedError, Equatable {
-    case network(String)
+    case missing
     case badManifest(String)
     case incompatible(version: String)
+    case unprotected
     case checksum
     case toolMissing
     case portBusy
@@ -366,10 +338,11 @@ public enum FirmwareError: Error, LocalizedError, Equatable {
 
     public var errorDescription: String? {
         switch self {
-        case .network(let detail): return "下载固件失败：\(detail)"
-        case .badManifest(let detail): return "官网的固件信息有问题（\(detail)），为了安全没有安装。"
-        case .incompatible(let version): return "官网最新的固件（\(version)）和这个版本的 Lepak 不配套，先不安装。"
-        case .checksum: return "下载的固件不完整，请重试。"
+        case .missing: return "这个版本的 Lepak 没有带固件，请用打包好的 Lepak。"
+        case .badManifest(let detail): return "Lepak 带的固件信息有问题（\(detail)），为了安全没有安装。"
+        case .incompatible(let version): return "Lepak 带的固件（\(version)）和这个版本的 Lepak 不配套，没有安装。"
+        case .unprotected: return "这个固件没有配对保护，为了安全没有安装。"
+        case .checksum: return "Lepak 带的固件文件不完整，请重新安装 Lepak。"
         case .toolMissing: return "这个版本的 Lepak 没有带安装工具。"
         case .portBusy: return "USB 连接被别的程序占着（比如 InputBetter），先退出它再试。"
         case .notConnected(let detail): return "连不上设备：\(detail)。拔掉 USB 线重新插上，或者重新开机后再试。"

@@ -1,0 +1,88 @@
+name: Release macOS App
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          else
+            TAG="dev-${GITHUB_SHA:0:7}"
+            VERSION="0.0.0-${GITHUB_SHA:0:7}"
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build and package Lepak.app
+        env:
+          LEPAK_BUILD_CONFIG: release
+          LEPAK_VERSION: ${{ env.VERSION }}
+        run: |
+          ./scripts/package-app.sh
+
+      - name: Check binary contains no keylogging code
+        run: |
+          BIN="dist/Lepak.app/Contents/MacOS/Lepak"
+          if nm -u "$BIN" | grep -E 'CGEventTapCreate|CGRequestListenEventAccess|CGPreflightListenEventAccess'; then
+            echo "::error::正式包包含键盘监听 API，终止发布"
+            exit 1
+          fi
+          if nm "$BIN" | grep -E 'KeyboardMonitor|KeyEcho'; then
+            echo "::error::正式包包含调试监听符号，终止发布"
+            exit 1
+          fi
+
+      - name: Archive and checksum
+        run: |
+          ARCHIVE="Lepak-${TAG}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/Lepak.app "dist/$ARCHIVE"
+          (cd dist && shasum -a 256 "$ARCHIVE" > SHA256SUMS.txt)
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lepak-${{ env.TAG }}-macos-arm64
+          path: |
+            dist/${{ env.ARCHIVE }}
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NOTES=$(cat <<'EOF'
+          ### 安装说明（Apple Silicon Mac，macOS 14+）
+
+          1. 下载并解压下方 zip，将 `Lepak.app` 拖入 `/Applications`（应用程序）。
+          2. 由于本包使用临时签名，首次打开前请在终端执行：
+             ```bash
+             xattr -cr /Applications/Lepak.app
+             ```
+          3. 打开 Lepak 后，按提示授予「辅助功能」权限（如使用 AI Passport 还需授予「蓝牙」权限）。
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/$ARCHIVE" "dist/SHA256SUMS.txt" --clobber
+          else
+            gh release create "$TAG" "dist/$ARCHIVE" "dist/SHA256SUMS.txt" \
+              --title "Lepak $TAG" \
+              --notes "$NOTES"
+          fi

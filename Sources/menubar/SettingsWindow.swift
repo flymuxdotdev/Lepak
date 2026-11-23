@@ -149,10 +149,18 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         pages.append(Page(section: .home, appearance: .aqua, name: "home-setup-light", setupMissing: true))
         pages.append(Page(section: .device(.passport), appearance: .darkAqua, name: "device-passport-setup-dark", setupMissing: true))
         pages.append(Page(section: .general, appearance: .aqua, name: "general-setup-light", setupMissing: true))
+        // AI Passport 还没配对：首页和设备页顶上的「配对」提醒条。
+        pages.append(Page(section: .device(.passport), appearance: .aqua, name: "device-passport-unpaired-light"))
+        // 配对对不上：设备不认这台 Mac / 设备清掉了配对。
+        pages.append(Page(section: .device(.passport), appearance: .darkAqua, name: "device-passport-rejected-dark"))
+        pages.append(Page(section: .home, appearance: .aqua, name: "home-passport-removed-light"))
         for page in pages {
             model.showSampleSetup(accessibility: !page.setupMissing,
                                   bluetooth: page.setupMissing ? .denied : .allowedAlways,
                                   mic: page.setupMissing ? .notInstalled : .installed)
+            model.updatePassportPaired(page.name != "device-passport-unpaired-light")
+            model.updatePassportRejection(page.name == "device-passport-rejected-dark" ? .macNotAccepted
+                                          : page.name == "home-passport-removed-light" ? .removedOnDevice : nil)
             let (section, theme, appearance, control, name, gestures) =
                 (page.section, page.theme, page.appearance, page.control, page.name, page.gestures)
             model.section = section
@@ -198,14 +206,22 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             (.connect(.passport), [], .aqua, "add-device-passport-light"),
             (.connect(.passport), [], .darkAqua, "add-device-passport-ready-dark"),
             (.connect(.passport), [], .aqua, "add-device-passport-installing-light"),
+            // 配对：Mac 正在弹系统的配对窗口 / 「重新配对」/ 连上的是没有配对保护的旧固件。
+            (.connect(.passport), [], .aqua, "add-device-passport-pairing-light"),
+            (.connect(.passport), [.passport], .darkAqua, "repair-passport-dark"),
+            (.connect(.passport), [], .aqua, "add-device-passport-unprotected-light"),
         ]
         for (step, devices, appearance, name) in sheets {
+            model.cancelAddDevice()
             model.config.devices = devices
-            if case .connect(let kind) = step {
+            if name == "repair-passport-dark" {
+                model.beginRepairPassport()
+            } else if case .connect(let kind) = step {
                 model.chooseDevice(kind)
             } else {
                 model.addDeviceStep = step
             }
+            model.updatePassportProtection(name != "add-device-passport-unprotected-light")
             model.showSampleUlanziWarning(name == "add-device-au05-dark")
             if name == "add-device-passport-light" {
                 model.updatePassport(DeviceSnapshot(link: .disconnected, note: "蓝牙已关闭"))
@@ -224,6 +240,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 }
             case "add-device-passport-installing-light":
                 model.showSampleSetup(accessibility: true, bluetooth: .notDetermined, mic: .notInstalled, busy: true)
+                model.updatePassport(DeviceSnapshot(link: .connecting))
+            case "add-device-passport-pairing-light", "repair-passport-dark":
+                model.showSampleSetup(accessibility: true, bluetooth: .allowedAlways, mic: .installed)
                 model.updatePassport(DeviceSnapshot(link: .connecting))
             default:
                 model.showSampleSetup(accessibility: true, bluetooth: .allowedAlways, mic: .installed)
@@ -245,7 +264,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             try? rep.representation(using: .png, properties: [:])?.write(to: url)
             print("wrote", url.path)
         }
-        model.addDeviceStep = nil
+        model.cancelAddDevice()
         PassportFirmwareSheet.snapshotAll(to: folder)
     }
 

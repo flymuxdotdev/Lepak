@@ -1,0 +1,387 @@
+// tools/ui-preview/preview_scenarios.c: 预览场景实现。
+//
+// 场景是一条连续的"剧本":与真机一样只通过 ib_ui.h 的公开接口改变界面(这些调用与 ib_app.c 中的一致),
+// 用 preview_advance() 推进虚拟时间,在关键时刻截图——包括动画中途的帧(文件名带 _<N>ms,
+// N 为距离触发调用的毫秒数)。页面切换是"淡出 120 ms 后再淡入 180 ms",所以 _fade_60ms 是旧页面
+// 正在淡出、_fade_200ms 是新页面正在淡入。
+// 新增场景时按顺序追加即可;编号决定输出文件的排序。
+#include "preview_scenarios.h"
+
+#include "ib_ui.h"
+#include "preview_host.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static const char *s_out_dir;
+static const char *s_filter;
+static int s_scale;
+static int s_index;
+static int s_failures;
+
+static void shot(const char *name)
+{
+    char path[512];
+    s_index++;
+    snprintf(path, sizeof(path), "%s/%02d_%s.png", s_out_dir, s_index, name);
+    if (s_filter && !strstr(path, s_filter)) return;
+    if (preview_capture(path, s_scale)) {
+        printf("  %s\n", path);
+    } else {
+        fprintf(stderr, "保存失败:%s\n", path);
+        s_failures++;
+    }
+}
+
+static void keys(ib_icon_t up, ib_icon_t down, ib_icon_t ok)
+{
+    ib_ui_set_key_icon(IB_UI_KEY_UP, up);
+    ib_ui_set_key_icon(IB_UI_KEY_DOWN, down);
+    ib_ui_set_key_icon(IB_UI_KEY_OK, ok);
+}
+
+// 模拟一段说话的电平起伏(每 100 ms 一个值),让声波截图里有高有低的历史柱。
+static void speak(void)
+{
+    static const uint8_t LEVELS[] = { 10, 45, 85, 60, 25, 70, 95, 55, 20, 5, 0, 35, 80, 65, 30, 50, 90, 40 };
+    for (unsigned i = 0; i < sizeof(LEVELS); i++) {
+        ib_ui_set_level(LEVELS[i]);
+        preview_advance(100);
+    }
+}
+
+static void set_list(uint16_t sel, uint16_t top)
+{
+    static const char *const APPS[] = { "Ghostty", "Chrome", "Xcode", "Finder", "Mail", "Notes", "Slack" };
+    const uint16_t n = (uint16_t)(sizeof(APPS) / sizeof(APPS[0]));
+    ib_ui_list_t l;
+    memset(&l, 0, sizeof(l));
+    snprintf(l.title, sizeof(l.title), "SWITCH APP");
+    for (uint16_t i = 0; i < IB_UI_LIST_ROWS && top + i < n; i++) {
+        snprintf(l.items[i], sizeof(l.items[i]), "%s", APPS[top + i]);
+        l.rows = (uint8_t)(i + 1);
+    }
+    l.n = n;
+    l.top = top;
+    l.sel = sel;
+    ib_ui_set_list(&l);
+}
+
+static void set_chinese_list(void)
+{
+    static const char *const ITEMS[] = {
+        "像素黑客风", "语音输入体验", "Passport 固件", "FoloVibe Key", "会话切换",
+    };
+    ib_ui_list_t l;
+    memset(&l, 0, sizeof(l));
+    snprintf(l.title, sizeof(l.title), "CODEX PROJECT");
+    for (uint16_t i = 0; i < sizeof(ITEMS) / sizeof(ITEMS[0]); i++) {
+        snprintf(l.items[i], sizeof(l.items[i]), "%s", ITEMS[i]);
+    }
+    l.rows = (uint8_t)(sizeof(ITEMS) / sizeof(ITEMS[0]));
+    l.n = l.rows;
+    l.sel = 0;
+    l.top = 0;
+    ib_ui_set_list(&l);
+}
+
+int preview_run_scenarios(const char *out_dir, int scale, const char *filter)
+{
+    s_out_dir = out_dir;
+    s_scale = scale;
+    s_filter = filter;
+    s_index = 0;
+    s_failures = 0;
+
+    // ---- OFFLINE:Mac 未连接,USB 线插着 ----
+    ib_ui_set_link(IB_UI_LINK_USB, false);
+    ib_ui_set_battery(87, false);
+    ib_ui_set_clock("23:41", "THU 10/15");
+    ib_ui_set_offline_hint("PRESS OK TO RECONNECT");
+    preview_advance(1500);
+    shot("offline_clock");
+    ib_ui_set_offline_hint("CONNECTING...");
+    preview_advance(200);
+    shot("offline_connecting");
+    // Lepak:蓝牙配对时离线页显示配对码;还没配对过任何 Mac 时的提示。
+    ib_ui_set_pair_code("482913");
+    preview_advance(200);
+    shot("offline_pair_code");
+    ib_ui_set_pair_code("");
+    ib_ui_set_offline_hint("NOT PAIRED / ADD IN LEPAK");
+    preview_advance(200);
+    shot("offline_not_paired");
+
+    // ---- IDLE:握手后 Mac 下发 config / keys / state ----
+    ib_ui_set_link(IB_UI_LINK_USB, true);
+    ib_ui_set_engine("Whisper Turbo");
+    keys(IB_ICON_ENTER, IB_ICON_ESC, IB_ICON_MIC);
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "");
+    preview_advance(60);
+    shot("offline_to_idle_fade_60ms");
+    preview_advance(140);
+    shot("offline_to_idle_fade_200ms");
+    preview_advance(1000);
+    shot("idle_dict");
+
+    keys(IB_ICON_BKSP, IB_ICON_DEL, IB_ICON_MIC);    // 上 / 下键映射为 Backspace / Delete
+    preview_advance(400);
+    shot("idle_dict_delete_keys");
+    keys(IB_ICON_ENTER, IB_ICON_ESC, IB_ICON_MIC);
+    preview_advance(400);
+
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_TR, "");      // 模式切换:左右滑动
+    preview_advance(100);
+    shot("idle_dict_to_tr_100ms");
+    preview_advance(600);
+    shot("idle_tr");
+
+    keys(IB_ICON_MODE, IB_ICON_HIDE, IB_ICON_PLAY);
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_SUB, "");
+    preview_advance(700);
+    shot("idle_sub");
+    ib_ui_key_press(IB_UI_KEY_OK);                  // 按键反馈:图标与边缘标记 60 ms 冲到白,再回落
+    preview_advance(60);
+    shot("idle_sub_press_ok_60ms");
+    preview_advance(140);
+    shot("idle_sub_press_ok_200ms");
+    preview_advance(400);
+
+    // ---- USAGE:进入 Agent 时先显示的用量首页 ----
+    ib_ui_usage_t usage;
+    memset(&usage, 0, sizeof(usage));
+    snprintf(usage.app, sizeof(usage.app), "CODEX");
+    snprintf(usage.today, sizeof(usage.today), "43,051,522");
+    snprintf(usage.week, sizeof(usage.week), "43,051,522");
+    snprintf(usage.total, sizeof(usage.total), "4,938,713,816");
+    snprintf(usage.reset, sizeof(usage.reset), "4D 2H");
+    snprintf(usage.plan, sizeof(usage.plan), "PLUS");
+    usage.tab = 0;
+    usage.left_percent = 7;
+    usage.has_quota = true;
+    usage.five_hour_left_percent = 63;
+    usage.has_five_hour_quota = true;
+    snprintf(usage.five_hour_reset, sizeof(usage.five_hour_reset), "2H 10M");
+    usage.credits = 0;
+    usage.ready = true;
+    ib_ui_set_usage(&usage);
+    keys(IB_ICON_UP, IB_ICON_DOWN, IB_ICON_MIC);
+    ib_ui_show(IB_UI_USAGE, IB_UI_MODE_DICT, "");
+    preview_advance(300);
+    shot("usage_today");
+    usage.tab = 2;
+    ib_ui_set_usage(&usage);
+    preview_advance(100);
+    shot("usage_total");
+
+    usage.tab = 0;
+    usage.has_panel = true;
+    snprintf(usage.panel_label[0], sizeof(usage.panel_label[0]), "5H LEFT");
+    snprintf(usage.panel_value[0], sizeof(usage.panel_value[0]), "63%%");
+    usage.panel_percent[0] = 63;
+    usage.panel_has_percent[0] = true;
+    snprintf(usage.panel_row_detail[0], sizeof(usage.panel_row_detail[0]), "5H RESET 2H 10M");
+    snprintf(usage.panel_label[1], sizeof(usage.panel_label[1]), "WEEK LEFT");
+    snprintf(usage.panel_value[1], sizeof(usage.panel_value[1]), "7%%");
+    usage.panel_percent[1] = 7;
+    usage.panel_has_percent[1] = true;
+    snprintf(usage.panel_row_detail[1], sizeof(usage.panel_row_detail[1]), "WEEK RESET 4D 2H");
+    snprintf(usage.panel_footer_left, sizeof(usage.panel_footer_left), "PLAN PLUS");
+    snprintf(usage.panel_footer_right, sizeof(usage.panel_footer_right), "CREDITS 0");
+    ib_ui_set_usage(&usage);
+    preview_advance(100);
+    shot("usage_codex_panel");
+
+    snprintf(usage.app, sizeof(usage.app), "DSH");
+    snprintf(usage.today, sizeof(usage.today), "347,103,089");
+    snprintf(usage.week, sizeof(usage.week), "347,103,089");
+    snprintf(usage.total, sizeof(usage.total), "2,345,563,337");
+    usage.tab = 0;
+    usage.has_quota = false;
+    usage.has_five_hour_quota = false;
+    usage.credits = -1;
+    usage.reset[0] = '\0';
+    snprintf(usage.plan, sizeof(usage.plan), "DEEPSEEK");
+    usage.has_panel = true;
+    snprintf(usage.panel_label[0], sizeof(usage.panel_label[0]), "CONTEXT");
+    snprintf(usage.panel_value[0], sizeof(usage.panel_value[0]), "19%%");
+    usage.panel_percent[0] = 19;
+    usage.panel_has_percent[0] = true;
+    usage.panel_row_detail[0][0] = '\0';
+    usage.panel_row_detail[1][0] = '\0';
+    snprintf(usage.panel_label[1], sizeof(usage.panel_label[1]), "SESSIONS");
+    snprintf(usage.panel_value[1], sizeof(usage.panel_value[1]), "136");
+    usage.panel_has_percent[1] = false;
+    snprintf(usage.panel_detail, sizeof(usage.panel_detail), "LAST 2H");
+    snprintf(usage.panel_footer_left, sizeof(usage.panel_footer_left), "DEEPSEEK-V4.1");
+    snprintf(usage.panel_footer_right, sizeof(usage.panel_footer_right), "TURNS 228");
+    ib_ui_set_usage(&usage);
+    preview_advance(100);
+    shot("usage_dsh_no_quota");
+    snprintf(usage.app, sizeof(usage.app), "CLAUDE");
+    snprintf(usage.today, sizeof(usage.today), "1,823,400");
+    snprintf(usage.week, sizeof(usage.week), "8,231,450");
+    snprintf(usage.total, sizeof(usage.total), "18,231,450");
+    snprintf(usage.panel_label[0], sizeof(usage.panel_label[0]), "SESSIONS");
+    snprintf(usage.panel_value[0], sizeof(usage.panel_value[0]), "12");
+    usage.panel_has_percent[0] = false;
+    snprintf(usage.panel_label[1], sizeof(usage.panel_label[1]), "TURNS");
+    snprintf(usage.panel_value[1], sizeof(usage.panel_value[1]), "48");
+    usage.panel_row_detail[0][0] = '\0';
+    usage.panel_row_detail[1][0] = '\0';
+    snprintf(usage.panel_detail, sizeof(usage.panel_detail), "LAST 2H");
+    snprintf(usage.panel_footer_left, sizeof(usage.panel_footer_left), "CLAUDE-OPUS-5");
+    snprintf(usage.panel_footer_right, sizeof(usage.panel_footer_right), "PROJECTS 4");
+    ib_ui_set_usage(&usage);
+    preview_advance(100);
+    shot("usage_claude_meta");
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "TAP OK: USAGE");
+    preview_advance(300);
+    shot("idle_usage_hint");
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "");
+    preview_advance(300);
+
+    // ---- REC:按住说话 → 免提 → 翻译模式 ----
+    keys(IB_ICON_NONE, IB_ICON_CANCEL, IB_ICON_STOP);
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "");
+    preview_advance(400);
+    ib_ui_set_ok_held(true);
+    ib_ui_set_level(15);
+    ib_ui_show(IB_UI_REC, IB_UI_MODE_DICT, "");
+    preview_advance(60);
+    shot("idle_to_rec_fade_60ms");
+    preview_advance(140);
+    shot("idle_to_rec_fade_200ms");
+    preview_advance(1000);
+    shot("rec_hold_low_level");
+    speak();
+    shot("rec_speaking");
+    preview_advance(33);
+    shot("rec_speaking_next_frame");                // 与上一张相比整体外移 2 px:流动连续
+    ib_ui_set_level(90);
+    preview_advance(600);
+    shot("rec_hold_high_level");
+    ib_ui_set_ok_held(false);
+    ib_ui_set_level(50);
+    preview_advance(400);
+    shot("rec_handsfree");
+    ib_ui_show(IB_UI_REC, IB_UI_MODE_TR, "");
+    preview_advance(400);
+    shot("rec_translate");
+    ib_ui_set_level(0);
+
+    // ---- PROC / DONE / ERR ----
+    keys(IB_ICON_NONE, IB_ICON_NONE, IB_ICON_NONE);
+    ib_ui_show(IB_UI_PROC, IB_UI_MODE_DICT, "");
+    preview_advance(700);
+    shot("proc");
+
+    ib_ui_show(IB_UI_DONE, IB_UI_MODE_DICT, "");
+    preview_advance(60);
+    shot("proc_to_done_fade_60ms");
+    preview_advance(140);
+    shot("done_200ms");
+    preview_advance(300);
+    shot("done_500ms");
+    preview_advance(250);
+    shot("done_750ms");
+    preview_advance(600);
+    shot("done");
+
+    ib_ui_show(IB_UI_ERR, IB_UI_MODE_DICT, "NO SPEECH");
+    preview_advance(60);
+    shot("done_to_err_fade_60ms");
+    preview_advance(150);                           // 淡入开始后约 90 ms:抖动中
+    shot("err_shake_210ms");
+    preview_advance(700);
+    shot("err");
+
+    // ---- SUB:字幕运行中 ----
+    keys(IB_ICON_TRANSLATE, IB_ICON_HIDE, IB_ICON_STOP);
+    ib_ui_set_level(60);
+    ib_ui_set_caption("我们今天把 Passport 的离线页换成绿色像素猫，底部留给点阵时钟。",
+                      "We replaced the Passport offline screen with a green pixel cat, leaving the bottom for the dot-matrix clock.",
+                      "ego lite", false);
+    ib_ui_show(IB_UI_SUB, IB_UI_MODE_SUB, "ego lite");
+    preview_advance(300);
+    shot("sub_intro_300ms");
+    speak();
+    shot("sub");
+    ib_ui_set_caption("这是一句正在识别、还没有翻译完的中文字幕。", "", "微信", true);
+    preview_advance(120);
+    shot("sub_live_no_translation");
+    ib_ui_set_level(0);
+
+    // ---- LIST:应用切换器(7 项)----
+    keys(IB_ICON_UP, IB_ICON_DOWN, IB_ICON_OPEN);
+    set_list(0, 0);
+    ib_ui_show(IB_UI_LIST, IB_UI_MODE_DICT, "");
+    preview_advance(500);
+    shot("list_sel0");
+    set_list(4, 0);
+    preview_advance(60);
+    shot("list_sel4_sliding_60ms");
+    preview_advance(400);
+    shot("list_sel4");
+    set_list(6, 1);
+    preview_advance(400);
+    shot("list_sel6_scrolled");
+    set_chinese_list();
+    preview_advance(300);
+    shot("list_chinese_project");
+
+    // ---- AGENT 通知 ----
+    keys(IB_ICON_ENTER, IB_ICON_ESC, IB_ICON_MIC);
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "");
+    preview_advance(500);
+    ib_ui_agent_show(IB_UI_AGENT_DONE, "Claude Code");   // 先铺黑色背景 100 ms,再淡入内容
+    preview_advance(50);
+    shot("agent_done_backdrop_50ms");
+    preview_advance(100);
+    shot("agent_done_150ms");
+    preview_advance(1500);
+    shot("agent_done");
+    ib_ui_agent_hide();                                  // 先淡出内容 120 ms,再撤背景 100 ms
+    preview_advance(60);
+    shot("agent_dismiss_60ms");
+    preview_advance(110);
+    shot("agent_dismiss_170ms");
+    preview_advance(200);
+
+    ib_ui_agent_show(IB_UI_AGENT_INPUT, "Claude Code");
+    preview_advance(900);
+    shot("agent_input");
+    preview_advance(2450);                          // 第二次摇摆的中段
+    shot("agent_input_wiggle");
+    ib_ui_agent_hide();
+    preview_advance(300);
+
+    // 录音中收到通知:只显示顶部横幅
+    keys(IB_ICON_NONE, IB_ICON_CANCEL, IB_ICON_STOP);
+    ib_ui_set_ok_held(true);
+    ib_ui_set_level(40);
+    ib_ui_show(IB_UI_REC, IB_UI_MODE_DICT, "");
+    preview_advance(300);
+    ib_ui_agent_show(IB_UI_AGENT_INPUT, "Claude Code");
+    preview_advance(800);
+    shot("rec_agent_banner");
+    ib_ui_agent_hide();
+    ib_ui_set_ok_held(false);
+    ib_ui_set_level(0);
+
+    // ---- 状态栏:低电量 / BLE + 充电 ----
+    keys(IB_ICON_ENTER, IB_ICON_ESC, IB_ICON_MIC);
+    ib_ui_show(IB_UI_IDLE, IB_UI_MODE_DICT, "");
+    ib_ui_set_battery(12, false);
+    preview_advance(800);
+    shot("idle_low_battery");
+    ib_ui_set_link(IB_UI_LINK_BLE, true);
+    ib_ui_set_battery(64, true);
+    preview_advance(300);
+    shot("idle_ble_charging");
+    ib_ui_set_link(IB_UI_LINK_USB, true);
+    ib_ui_set_battery(87, false);
+
+
+    return s_failures;
+}

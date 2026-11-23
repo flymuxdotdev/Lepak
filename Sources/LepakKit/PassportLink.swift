@@ -13,6 +13,15 @@ public struct PassportBattery: Sendable, Equatable {
     public var charging: Bool
 }
 
+/// 配对过的设备连上了却不肯握手：两边的配对记录对不上。
+public enum PassportRejection: Sendable, Equatable {
+    /// 设备不认这台 Mac（多半是 Mac 上删了配对，设备还记着）：在设备上长按 ▼ 打开配对，再重新配对。
+    case macNotAccepted
+    /// 设备那边清掉了配对，Mac 还记着旧的（系统报「对方删除了配对信息」，不会自己重配）：
+    /// 先在「系统设置 → 蓝牙」里删掉这台设备，再重新配对。
+    case removedOnDevice
+}
+
 public enum PassportLinkState: Sendable, Equatable {
     /// 蓝牙关着、没允许 Lepak 用蓝牙、这台 Mac 不支持低功耗蓝牙。
     case bluetoothOff, unauthorized, unsupported
@@ -74,17 +83,66 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     private var keyIcons: [String: String] = [:]
     private var screenOffSeconds = 60
     private var stopped = false
+    /// 配对模式（「添加设备」第二步、「重新配对」）：去连附近的设备、让它配对。平时只连配对过的那一台。
+    private var pairing = false
+    /// 配对模式里连不上或被拒绝的设备（多半是别人的）：这个时刻之前不再试。
+    private var cooldown: [UUID: DispatchTime] = [:]
+    /// 配对模式里扫到的设备和信号强度：挑信号最强的（最可能是用户手上那台）去连。
+    private var candidates: [UUID: Candidate] = [:]
+    private var choosing = false
+    private var connectTimeout: DispatchWorkItem?
 
-    /// 上次连上的设备，下次启动先直接连它（蓝牙地址不变就不用重新扫描）。
+    private struct Candidate {
+        let peripheral: CBPeripheral
+        let rssi: Int
+        let seen: DispatchTime
+    }
+
+    /// 配对过的那台设备（握手成功过的）。平时只连它；Lepak 的固件那边也只认配对过的 Mac。
     private static let rememberedKey = "passport.peripheral"
     private static let pingInterval: TimeInterval = 5
     /// 这么久没收到设备的任何消息，就当连接已经坏了，断开重连。设备那边是 15 秒。
     private static let silenceLimit: UInt64 = 15_000_000_000
+    /// 握手之前（设备在等用户在 Mac 上输配对码，不说话）放宽到这么久；设备那边配对窗口是 90 秒。
+    private static let pairingSilenceLimit: UInt64 = 95_000_000_000
+    /// 配对模式里一台设备连不上 / 没配对上，隔这么久再试。
+    private static let pairingCooldown: TimeInterval = 20
+    /// 配对模式里连一台设备最多等这么久（设备在广播，正常一两秒就连上）。
+    private static let connectAttemptLimit: TimeInterval = 8
+
+    /// 有没有配对过的设备：`start()` 时报一次，之后变了再报（在内部队列上调用）。
+    public var onPaired: ((Bool) -> Void)?
+    /// 设备固件有没有配对保护（Lepak 固件的 hello 带 `"pair":1`），每次握手报一次。
+    public var onPairProtection: ((Bool) -> Void)?
+    /// 配对过的设备拒绝握手（见 `PassportRejection`）；握手成功或开始重新配对时报 nil。
+    public var onRejection: ((PassportRejection?) -> Void)?
+
+    /// 平时（不在配对模式）连上配对过的设备、却没握手就断开的次数，连续两次就当是被拒绝了。
+    private var handshakeFailures = 0
+    private var rejection: PassportRejection? {
+        didSet { if rejection != oldValue { onRejection?(rejection) } }
+    }
+    /// 被拒绝时别一直秒重连（设备那边每次都要算一遍，费电），隔这么久再试。
+    private static let rejectedRetryDelay: TimeInterval = 10
+
+    private var pairedID: UUID? {
+        get { UserDefaults.standard.string(forKey: Self.rememberedKey).flatMap(UUID.init(uuidString:)) }
+        set {
+            guard newValue != pairedID else { return }
+            if let newValue {
+                UserDefaults.standard.set(newValue.uuidString, forKey: Self.rememberedKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.rememberedKey)
+            }
+            onPaired?(newValue != nil)
+        }
+    }
 
     /// 开始找设备、连上。`stop()` 之后再调用会重新开始（用户把 AI Passport 移除后又添加回来）。
     public func start() {
         queue.async { [self] in
             stopped = false
+            onPaired?(pairedID != nil)
             guard central == nil else {
                 connectOrScan()
                 return
@@ -102,9 +160,48 @@ public final class PassportLink: NSObject, @unchecked Sendable {
             if online { send(["cmd": "bye"]) }
             timer?.cancel()
             timer = nil
+            connectTimeout?.cancel()
+            candidates.removeAll()
             if central?.isScanning == true { central?.stopScan() }
             if let peripheral { central?.cancelPeripheralConnection(peripheral) }
             setState(.searching)
+        }
+    }
+
+    /// 打开 / 关闭配对模式（「添加设备」第二步、「重新配对」时打开）。
+    /// 开着时去连附近信号最强的一台；Lepak 固件会要求配对，Mac 弹出系统的蓝牙配对窗口，输入设备屏幕上的 6 位数字。
+    /// 握手成功的那台就是配对过的设备，以后只连它。关掉时断开还没配对上的那台。
+    public func setPairing(_ on: Bool) {
+        queue.async { [self] in
+            guard on != pairing else { return }
+            pairing = on
+            handshakeFailures = 0
+            rejection = nil
+            cooldown.removeAll()
+            candidates.removeAll()
+            connectTimeout?.cancel()
+            if !on, let peripheral, peripheral.identifier != pairedID {
+                central?.cancelPeripheralConnection(peripheral)
+                resetLink()
+                self.peripheral = nil
+            }
+            if central?.isScanning == true { central?.stopScan() }
+            connectOrScan()
+        }
+    }
+
+    /// 「重新配对」：断开并忘掉配对过的那台，之后在配对模式里配上的那台成为新的。
+    public func forgetPaired() {
+        queue.async { [self] in
+            if online { send(["cmd": "bye"]) }
+            if let peripheral { central?.cancelPeripheralConnection(peripheral) }
+            resetLink()
+            peripheral = nil
+            pairedID = nil
+            handshakeFailures = 0
+            rejection = nil
+            setState(.searching)
+            connectOrScan()
         }
     }
 
@@ -136,24 +233,75 @@ public final class PassportLink: NSObject, @unchecked Sendable {
         onState?(next)
     }
 
-    /// 先连上次那台，同时扫描：设备换了（或者重刷后蓝牙身份变了）也能找到。
+    /// 平时：只连配对过的那台（先按记住的身份直接连，同时扫描只认它）。别的 AI Passport 一律不理。
+    /// 配对模式：扫描，挑信号最强、没被拒过的一台去连（见 `chooseCandidate`）。
     private func connectOrScan() {
         guard let central, central.state == .poweredOn, !stopped else { return }
         if let peripheral, peripheral.state == .connected || peripheral.state == .connecting { return }
         setState(.searching)
-        if peripheral == nil,
-           let text = UserDefaults.standard.string(forKey: Self.rememberedKey),
-           let id = UUID(uuidString: text),
-           let known = central.retrievePeripherals(withIdentifiers: [id]).first {
+        if pairing {
+            if !central.isScanning {
+                // 重复上报：被拒过的设备冷却完了还能再被扫到，信号强度也随时更新。
+                central.scanForPeripherals(withServices: [Self.serviceUUID],
+                                           options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+            }
+            scheduleChoice()
+            return
+        }
+        guard let id = pairedID else {
+            // 还没配对过：不连、也不扫描，不去碰附近别人的设备。等「添加设备」或「重新配对」。
+            if central.isScanning { central.stopScan() }
+            return
+        }
+        if peripheral?.identifier != id, let known = central.retrievePeripherals(withIdentifiers: [id]).first {
             adopt(known)
         }
-        if let peripheral {
+        if let peripheral, peripheral.identifier == id {
             // 没有超时：设备不在范围内时一直等着，回来就自动连上。
             central.connect(peripheral)
         }
         if !central.isScanning {
             central.scanForPeripherals(withServices: [Self.serviceUUID])
         }
+    }
+
+    /// 配对模式：等一会儿让附近的几台都扫到，再挑。
+    private func scheduleChoice() {
+        guard pairing, !choosing else { return }
+        if let peripheral, peripheral.state == .connected || peripheral.state == .connecting { return }
+        choosing = true
+        queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.chooseCandidate() }
+    }
+
+    private func chooseCandidate() {
+        choosing = false
+        guard pairing, !stopped, let central else { return }
+        if let peripheral, peripheral.state == .connected || peripheral.state == .connecting { return }
+        let now = DispatchTime.now()
+        let usable = candidates.values.filter {
+            now.uptimeNanoseconds - $0.seen.uptimeNanoseconds < 5_000_000_000
+                && (cooldown[$0.peripheral.identifier].map { $0 <= now } ?? true)
+        }
+        guard let best = usable.max(by: { $0.rssi < $1.rssi }) else { return }
+        note("配对：连信号最强的一台（\(best.rssi) dBm）")
+        adopt(best.peripheral)
+        central.connect(best.peripheral)
+        armConnectTimeout(best.peripheral.identifier)
+    }
+
+    /// 配对模式里一台设备迟迟连不上（走远了、被别的 Mac 占着）：放弃它，换下一台。
+    private func armConnectTimeout(_ id: UUID) {
+        connectTimeout?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let peripheral, peripheral.identifier == id, peripheral.state == .connecting else { return }
+            note("配对：这台连不上，换下一台")
+            cooldown[id] = .now() + Self.pairingCooldown
+            central?.cancelPeripheralConnection(peripheral)
+            self.peripheral = nil
+            connectOrScan()
+        }
+        connectTimeout = work
+        queue.asyncAfter(deadline: .now() + Self.connectAttemptLimit, execute: work)
     }
 
     private func adopt(_ next: CBPeripheral) {
@@ -188,8 +336,10 @@ public final class PassportLink: NSObject, @unchecked Sendable {
     private func tick() {
         ticks += 1
         let now = DispatchTime.now()
-        if now.uptimeNanoseconds - lastHeard.uptimeNanoseconds > Self.silenceLimit {
-            note("设备 15 秒没有回应，断开重连")
+        // 握手之前设备可能在等用户输配对码（什么都不发），多等一会儿。
+        let limit = online ? Self.silenceLimit : Self.pairingSilenceLimit
+        if now.uptimeNanoseconds - lastHeard.uptimeNanoseconds > limit {
+            note(online ? "设备 15 秒没有回应，断开重连" : "一直没有握手成功（配对没完成？），断开重连")
             if let peripheral { central?.cancelPeripheralConnection(peripheral) }
             return
         }
@@ -228,8 +378,16 @@ public final class PassportLink: NSObject, @unchecked Sendable {
             let firstTime = !online
             online = true
             if firstTime { note("握手成功：固件 \(firmware) \(version)") }
+            handshakeFailures = 0
+            rejection = nil
+            // 握手成功的就是配对过的设备：记住它，以后平时只连它。
+            if let id = peripheral?.identifier, id != pairedID {
+                pairedID = id
+                note("记住了这台设备，以后只连它")
+            }
             setState(.online(firmware: version))
             onFirmware?(version, object["build"] as? String)
+            onPairProtection?((object["pair"] as? Int) == 1)
             sendConfig()
             sendMicState()
             sendKeys()
@@ -377,18 +535,26 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
     public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any], rssi RSSI: NSNumber) {
         guard !stopped else { return }
-        if let current = self.peripheral {
-            if current.identifier == peripheral.identifier || current.state == .connected { return }
+        let id = peripheral.identifier
+        if pairing {
+            if let until = cooldown[id], until > .now() { return }
+            let rssi = RSSI.intValue == 127 ? -100 : RSSI.intValue     // 127 表示读不到
+            candidates[id] = Candidate(peripheral: peripheral, rssi: rssi, seen: .now())
+            scheduleChoice()
+            return
         }
-        note("找到设备 \(peripheral.name ?? "未命名")，正在连接")
+        // 平时只认配对过的那台：附近别人的 AI Passport 不去连。
+        guard id == pairedID else { return }
+        if let current = self.peripheral, current.identifier == id, current.state != .disconnected { return }
+        note("找到配对过的设备，正在连接")
         adopt(peripheral)
         central.connect(peripheral)
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard peripheral.identifier == self.peripheral?.identifier else { return }
+        connectTimeout?.cancel()
         central.stopScan()
-        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.rememberedKey)
         setState(.connecting)
         lastHeard = .now()
         peripheral.discoverServices([Self.serviceUUID])
@@ -396,7 +562,16 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
 
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         note("连接失败：\(error?.localizedDescription ?? "未知原因")")
-        queue.asyncAfter(deadline: .now() + 2) { [weak self] in self?.connectOrScan() }
+        if pairing { cooldown[peripheral.identifier] = .now() + Self.pairingCooldown }
+        if !pairing, Self.peerRemovedPairing(error) { rejection = .removedOnDevice }
+        let delay: TimeInterval = rejection == nil ? 2 : Self.rejectedRetryDelay
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in self?.connectOrScan() }
+    }
+
+    /// 系统说「对方删除了配对信息」（CBError.peerRemovedPairingInformation = 14）：设备清掉了配对，Mac 还记着。
+    private static func peerRemovedPairing(_ error: Error?) -> Bool {
+        guard let error = error as NSError? else { return false }
+        return error.domain == CBErrorDomain && error.code == 14
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
@@ -406,6 +581,28 @@ extension PassportLink: CBCentralManagerDelegate, CBPeripheralDelegate {
         resetLink()
         if stopped { return }
         if wasOnline { note("蓝牙断开\(error.map { "：\($0.localizedDescription)" } ?? "")") }
+        if pairing, !wasOnline {
+            // 没握手就断了：设备拒绝了（配过别的 Mac、没开配对），或者用户取消了配对窗口。先换别的设备试。
+            note("配对：这台没配上，换下一台")
+            cooldown[peripheral.identifier] = .now() + Self.pairingCooldown
+        }
+        if !pairing, !wasOnline {
+            // 平时连的就是配对过的那台，它却不肯握手：两边的配对记录对不上。
+            if Self.peerRemovedPairing(error) {
+                rejection = .removedOnDevice
+            } else {
+                handshakeFailures += 1
+                if handshakeFailures >= 2, rejection == nil {
+                    note("设备不认这台 Mac 了（Mac 上的配对可能被删了），需要重新配对")
+                    rejection = .macNotAccepted
+                }
+            }
+        }
+        if rejection != nil, !pairing {
+            setState(.searching)
+            queue.asyncAfter(deadline: .now() + Self.rejectedRetryDelay) { [weak self] in self?.connectOrScan() }
+            return
+        }
         setState(.searching)
         connectOrScan()
     }

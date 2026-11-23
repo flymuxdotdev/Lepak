@@ -1,0 +1,174 @@
+// main/ib_ui_idle.c: IDLE 页:当前模式(docs/device-ui.md「IDLE」)。
+//
+// 一屏只有"一个点阵图形 + 一行字":
+//   字形    当前模式的点阵图标(dict = 麦克风、tr = 两个对话气泡、sub = CC 框,ib_ui_dots),
+//           绿色点阵;每 4 s 一道扫描光自上而下掠过,经过的点变亮并略微放大。
+//   模式名  Roboto Mono 14,中心 y=220
+// 操作提示由右侧按键提示列承担。切换模式:点阵从旧字形重排成新字形(从左到右"重新像素化"),
+// 模式名纵向翻牌(旧的向上 / 下翻出淡出,新的从另一侧翻入)。按下 OK 时由 REC 页接着这一帧把点重排成一条线。
+#include "ib_ui_dots.h"
+#include "ib_ui_gfx.h"
+#include "ib_ui_page.h"
+
+#define NAME_CY     (220 - IB_UI_BAR_H)
+#define FLIP_MS     400
+#define FLIP_PX     24
+#define OUT_MS      140                     // 旧模式名 0..140 ms 翻出
+#define IN_T0       140                     // 新模式名 140..360 ms 翻入(旧的完全消失后,两行字不会叠在一起)
+#define IN_MS       220
+#define SCAN_EVERY_MS 4000
+#define SCAN_MS     800                     // 扫描光自上而下用时
+#define SCAN_ROW0   6                       // 扫描光起止行(覆盖字形 8..17 行)
+#define SCAN_ROW1   20
+
+static lv_obj_t *s_fx;
+static lv_obj_t *s_names[2];
+static lv_obj_t *s_footer;
+static int s_front;
+static int s_dir;                           // +1:下一个模式(旧名字向上翻出);-1:上一个
+static ib_ui_mode_t s_mode;
+static int32_t s_scan = -1;                 // 扫描光所在行(x16);-1 表示没有扫描
+
+static const char *const MODE_NAMES[IB_UI_MODE_COUNT] = { "HOLD OK TO TALK", "TRANSLATE", "SUBTITLES" };
+static const ib_dots_glyph_t MODE_GLYPHS[IB_UI_MODE_COUNT] = {
+    [IB_UI_MODE_DICT] = IB_DOTS_MIC, [IB_UI_MODE_TR] = IB_DOTS_TR, [IB_UI_MODE_SUB] = IB_DOTS_CC,
+};
+
+static void fx_draw(lv_event_t *e)
+{
+    ib_fx_t fx;
+    ib_fx_begin(&fx, e);
+    // 控件只覆盖点阵区域:边框随图形一起刷新,不遮挡右侧实体键提示。
+    ib_fx_frame(&fx, 6, 4, IB_UI_CONTENT_W - 12, IB_DOTS_BOX_H - 8, 0, 1,
+                IB_C(IB_COLOR_MATRIX_FRAME), LV_OPA_COVER);
+    uint32_t now = lv_tick_get();
+    if (!ib_dots_settled(now) || s_scan < 0) {
+        ib_dots_draw(&fx, now, 0);
+        return;
+    }
+    // 扫描光:离光带越近越亮,正中的一行放大 1 px。
+    const ib_dots_t *g = ib_dots_current();
+    for (int i = 0; i < g->n; i++) {
+        const ib_dot_t *d = &g->d[i];
+        int32_t dist = LV_ABS(d->r * 16 - s_scan);               // x16
+        int32_t glow = dist < 24 ? (24 - dist) * IB_P_ONE / 24 : 0;
+        lv_color_t c = lv_color_mix(IB_C(IB_COLOR_MATRIX_BRIGHT), IB_C(IB_COLOR_MATRIX_SOFT),
+                                    (uint8_t)(glow * 255 / IB_P_ONE));
+        ib_dots_dot(&fx, ib_dots_x(d->c), ib_dots_y(d->r), c, dist < 8 ? 1 : 0);
+    }
+}
+
+static void target_for(ib_ui_mode_t mode, ib_dots_t *out)
+{
+    ib_dots_glyph(out, MODE_GLYPHS[mode], IB_DOT_SOFT);
+}
+
+static void name_place(lv_obj_t *l, int32_t dy, lv_opa_t opa)
+{
+    lv_obj_set_style_translate_y(l, dy, 0);
+    lv_obj_set_style_opa(l, opa, 0);
+}
+
+// 模式名翻牌:t 为 0..FLIP_MS 的毫秒。
+static void flip_cb(lv_anim_t *a, int32_t t)
+{
+    (void)a;
+    lv_obj_t *in = s_names[s_front], *out = s_names[1 - s_front];
+    int32_t po = IB_P_ONE - ib_ease_out_cubic(IB_P_ONE - ib_progress((uint32_t)t, 0, OUT_MS));   // ease-in
+    name_place(out, -s_dir * FLIP_PX * po / IB_P_ONE, ib_opa_scale(255, IB_P_ONE - po));
+    int32_t pi = ib_ease_out_cubic(ib_progress((uint32_t)t, IN_T0, IN_MS));
+    name_place(in, s_dir * FLIP_PX * (IB_P_ONE - pi) / IB_P_ONE, ib_opa_scale(255, pi));
+}
+
+static void snap_name(ib_ui_mode_t mode)
+{
+    lv_anim_delete(&s_names, NULL);
+    lv_label_set_text_static(s_names[s_front], MODE_NAMES[mode]);
+    name_place(s_names[s_front], 0, LV_OPA_COVER);
+    name_place(s_names[1 - s_front], 0, LV_OPA_TRANSP);
+}
+
+static void flip_name(ib_ui_mode_t mode)
+{
+    s_front = 1 - s_front;
+    lv_label_set_text_static(s_names[s_front], MODE_NAMES[mode]);
+    lv_anim_delete(&s_names, NULL);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, &s_names);         // 仅作为动画的唯一标识
+    lv_anim_set_custom_exec_cb(&a, flip_cb);
+    lv_anim_set_values(&a, 0, FLIP_MS);
+    lv_anim_set_duration(&a, FLIP_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_start(&a);
+}
+
+static lv_obj_t *create(lv_obj_t *parent, const ib_ui_ctx_t *ctx)
+{
+    (void)ctx;
+    lv_obj_t *root = ib_box_create(parent, 0, 0, IB_UI_CONTENT_W, IB_UI_PAGE_H);
+    ib_terminal_header(root, "> READY_", IB_COLOR_MATRIX_SOFT, IB_UI_CONTENT_W);
+    s_fx = ib_fx_create(root, 0, IB_DOTS_BOX_Y, IB_UI_CONTENT_W, IB_DOTS_BOX_H, fx_draw, NULL);
+    for (int i = 0; i < 2; i++) {
+        s_names[i] = ib_label_create(root, &ib_terminal_font_14, IB_COLOR_TEXT,
+                                     ib_font_top(&ib_terminal_font_14, NAME_CY), IB_UI_CONTENT_W);
+    }
+    s_footer = ib_label_create(root, &ib_terminal_font_12, IB_COLOR_TEXT_MID, 252, IB_UI_CONTENT_W - 20);
+    lv_obj_set_style_text_align(s_footer, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_align(s_footer, LV_ALIGN_TOP_LEFT, 10, 252);
+    lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    return root;
+}
+
+static void update_footer(const ib_ui_ctx_t *ctx)
+{
+    if (ctx->msg[0]) {
+        lv_label_set_text_static(s_footer, ctx->msg);
+        lv_obj_remove_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void enter(const ib_ui_ctx_t *ctx)
+{
+    s_mode = ctx->mode;
+    ib_dots_t g;
+    target_for(s_mode, &g);
+    ib_dots_enter(ctx, &g);
+    snap_name(s_mode);
+    update_footer(ctx);
+}
+
+static void update(const ib_ui_ctx_t *ctx)
+{
+    update_footer(ctx);
+    if (ctx->mode == s_mode) return;
+    // 循环顺序 dict → tr → sub:前进时旧名字向上翻出,后退时向下。
+    s_dir = ctx->mode == (ib_ui_mode_t)((s_mode + 1) % IB_UI_MODE_COUNT) ? 1 : -1;
+    s_mode = ctx->mode;
+    ib_dots_t g;
+    target_for(s_mode, &g);
+    ib_dots_show(&g, true, false, ctx->now_ms);
+    flip_name(s_mode);
+}
+
+static void frame(const ib_ui_ctx_t *ctx)
+{
+    // 扫描光:以本页进入(或上次重排结束)为起点,每 4 s 一次,800 ms 内从第 6 行扫到第 20 行。
+    uint32_t since = ctx->now_ms - ib_dots_settle_ms();
+    bool was_scanning = s_scan >= 0;
+    if (ib_dots_settled(ctx->now_ms) && since >= SCAN_EVERY_MS && since % SCAN_EVERY_MS < SCAN_MS) {
+        int32_t p = ib_ease_in_out_sine(ib_progress(since % SCAN_EVERY_MS, 0, SCAN_MS));
+        s_scan = (SCAN_ROW0 * 16) + (SCAN_ROW1 - SCAN_ROW0) * 16 * p / IB_P_ONE;
+    } else {
+        s_scan = -1;
+    }
+    // 重排、扫描进行中,或扫描刚结束(要擦掉最后一帧的光)时才重绘。
+    if (!ib_dots_settled(ctx->now_ms) || s_scan >= 0 || was_scanning ||
+        ctx->now_ms - ib_dots_settle_ms() < 100) {
+        lv_obj_invalidate(s_fx);
+    }
+}
+
+const ib_ui_page_t ib_ui_page_idle = { create, enter, update, frame };

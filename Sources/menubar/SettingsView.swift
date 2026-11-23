@@ -117,6 +117,9 @@ private struct Sidebar: View {
                     .help(link.text)
                     .contextMenu {
                         Button("重命名…") { model.beginRename(kind) }
+                        if kind == .passport {
+                            Button("重新配对…") { model.beginRepairPassport() }
+                        }
                         Button("移除设备…") { model.removingDevice = kind }
                     }
                 }
@@ -676,9 +679,13 @@ private struct DevicePage: View {
                         .fixedSize()
                 }
                 if kind == .passport {
-                    PassportFirmwareBadge(accent: theme.accent)
+                    PassportFirmwareBadge(accent: theme.accent) { model.beginRepairPassport() }
                 }
                 HStack(spacing: 8) {
+                    if kind == .passport {
+                        // 换了一台设备，或者这台在 Mac 上的配对被删了：重新配对。
+                        CircleIconButton(systemImage: "link", help: "重新配对") { model.beginRepairPassport() }
+                    }
                     CircleIconButton(systemImage: "pencil", help: "重命名") { model.beginRename(kind) }
                     CircleIconButton(systemImage: "trash", help: "移除这台设备") { model.removingDevice = kind }
                 }
@@ -857,7 +864,7 @@ private struct SetupBanner: View {
                 .font(.system(size: 13, weight: .medium))
                 .lineLimit(1)
             Spacer(minLength: 8)
-            Button("去允许") { open() }
+            Button(buttonTitle) { open() }
                 .buttonStyle(PillButtonStyle(kind: .accent(.orange), height: 28))
         }
         .padding(.leading, 14)
@@ -870,6 +877,18 @@ private struct SetupBanner: View {
         switch issue {
         case .accessibility: return "还没允许「辅助功能」，设备上的键现在发不出去。"
         case .bluetoothDenied: return "还没允许 Lepak 使用蓝牙，连不上 AI Passport。"
+        case .passportUnpaired: return "AI Passport 还没配对：Lepak 只连配对过的设备，现在不会去连它。"
+        case .passportRejected: return "AI Passport 不认这台 Mac 了：在设备上长按 ▼，再点「重新配对」。"
+        case .passportPairingRemoved: return "AI Passport 清掉了配对：先在系统蓝牙设置里删掉它，再点「重新配对」。"
+        }
+    }
+
+    private var buttonTitle: String {
+        switch issue {
+        case .accessibility, .bluetoothDenied: return "去允许"
+        case .passportUnpaired: return "配对"
+        case .passportRejected: return "重新配对"
+        case .passportPairingRemoved: return "打开蓝牙设置"
         }
     }
 
@@ -877,6 +896,8 @@ private struct SetupBanner: View {
         switch issue {
         case .accessibility: model.openAccessibilitySettings()
         case .bluetoothDenied: model.openBluetoothPrivacySettings()
+        case .passportUnpaired, .passportRejected: model.beginRepairPassport()
+        case .passportPairingRemoved: model.openBluetoothSettings()
         }
     }
 }
@@ -992,16 +1013,20 @@ struct AddDeviceSheet: View {
     private func connectStep(_ kind: DeviceKind) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 12) {
-                Button { model.addDeviceStep = .choose } label: {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(width: 30, height: 30)
-                        .background(Circle().fill(Palette.raised))
-                        .contentShape(Circle())
+                // 「重新配对」是从设备页直接进来的，没有上一步。
+                if !model.repairingPassport {
+                    Button { model.addDeviceStep = .choose } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 13, weight: .semibold))
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(Palette.raised))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("上一步")
                 }
-                .buttonStyle(.plain)
-                .help("上一步")
-                Text("连接 \(kind.name)").font(.system(size: 24, weight: .bold))
+                Text(model.repairingPassport ? "重新配对 \(model.displayName(kind))" : "连接 \(kind.name)")
+                    .font(.system(size: 24, weight: .bold))
             }
             .padding(.bottom, 20)
             // 清单：连接、（蓝牙）、辅助功能、（Lepak 麦克风）。每项实时更新，缺什么就在那一行给按钮。
@@ -1011,6 +1036,8 @@ struct AddDeviceSheet: View {
                 VStack(alignment: .leading, spacing: 0) {
                     connectionRow(kind)
                     if kind == .passport {
+                        RowDivider()
+                        pairingRow
                         RowDivider()
                         bluetoothRow
                     }
@@ -1030,8 +1057,10 @@ struct AddDeviceSheet: View {
                 UlanziBanner(model: model)
                     .padding(.top, 12)
             }
-            nameField(kind)
-                .padding(.top, 16)
+            if !model.repairingPassport {
+                nameField(kind)
+                    .padding(.top, 16)
+            }
             HStack(spacing: 10) {
                 Note(footerNote(kind))
                 Spacer(minLength: 12)
@@ -1071,7 +1100,31 @@ struct AddDeviceSheet: View {
             return SetupRow(mark: .done, title: "设备已连接",
                             detail: device.percent.map { "电量 \($0)%。" } ?? "可以用了。") { EmptyView() }
         }
+        if kind == .passport, device.link == .connecting {
+            // 蓝牙连上了、还没握手：在配对（见下一行）。
+            return SetupRow(mark: .done, title: "找到了设备", detail: "正在配对，见下一行。") { EmptyView() }
+        }
         return SetupRow(mark: .waiting, title: "正在寻找设备…", detail: Self.connectHint(kind)) { EmptyView() }
+    }
+
+    /// 配对（只有 AI Passport）：Lepak 固件要求配对，Mac 弹出系统的蓝牙配对窗口，输入设备屏幕上的 6 位数字。
+    @ViewBuilder private var pairingRow: some View {
+        let link = model.passport.link
+        if link == .connected {
+            if model.passportProtected == false {
+                SetupRow(mark: .action, title: "这台设备的固件没有配对保护",
+                         detail: "附近别人的 Mac 也能连上它。到设备页的「固件」里安装带配对保护的固件。") { EmptyView() }
+            } else {
+                SetupRow(mark: .done, title: "已配对",
+                         detail: "只有这台 Mac 能用它，附近别人的 Mac 连不上。") { EmptyView() }
+            }
+        } else if link == .connecting {
+            SetupRow(mark: .waiting, title: "正在配对",
+                     detail: "Mac 会弹出系统的「蓝牙配对」窗口：输入设备屏幕上的 6 位数字就行，不用输密码。") { EmptyView() }
+        } else {
+            SetupRow(mark: .waiting, title: "等待配对",
+                     detail: "连上后设备屏幕会显示 6 位配对码。这台设备配过别的 Mac 的话，先在设备上长按 ▼ 打开配对。") { EmptyView() }
+        }
     }
 
     /// 蓝牙（只有 AI Passport）：先看蓝牙本身能不能用，再看有没有允许 Lepak 用。
@@ -1144,6 +1197,15 @@ struct AddDeviceSheet: View {
     }
 
     private func footerNote(_ kind: DeviceKind) -> String {
+        if model.repairingPassport {
+            return model.passport.link == .connected ? "配好了，点「完成」。" : "配对完成之前，Lepak 不会连别的设备。"
+        }
+        // AI Passport 要配对过才会自动连：没配完就点「完成」的话，之后在设备页点「配对」。
+        if kind == .passport, model.passport.link != .connected {
+            return model.passport.link == .connecting
+                ? "在 Mac 弹出的窗口里输入配对码，配好后点「完成」。"
+                : "也可以先点「完成」，以后在设备页点「配对」。"
+        }
         if model.snapshot(of: kind).link != .connected {
             return "还没连上也可以先点「完成」，设备开机后会自动连上。"
         }

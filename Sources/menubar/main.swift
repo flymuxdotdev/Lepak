@@ -317,6 +317,22 @@ final class MenuBarApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 接好 AI Passport 的回调；真正开始连（开蓝牙）要等用户添加了它，见 `connect(_:)`。
     private func setUpPassport() {
+        // 配对：平时只连配对过的那台；「添加设备」第二步 / 「重新配对」时才去连附近还没配对的设备。
+        passport.onPaired = { [weak self] paired in
+            Task { @MainActor in self?.settings.updatePassportPaired(paired) }
+        }
+        passport.onPairProtection = { [weak self] protected in
+            Task { @MainActor in self?.settings.updatePassportProtection(protected) }
+        }
+        passport.onRejection = { [weak self] rejection in
+            Task { @MainActor in self?.settings.updatePassportRejection(rejection) }
+        }
+        settings.onPassportPairingChange = { [weak self] on in
+            self?.passport.setPairing(on)
+        }
+        settings.onPassportForget = { [weak self] in
+            self?.passport.forgetPaired()
+        }
         passport.onState = { [weak self] state in
             Task { @MainActor in
                 guard let self else { return }

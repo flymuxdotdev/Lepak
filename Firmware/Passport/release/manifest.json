@@ -1,0 +1,14 @@
+{
+  "name": "Lepak AI Passport",
+  "version": "1.0.0",
+  "build": "506deb46",
+  "proto": 1,
+  "pair": 1,
+  "chip": "ESP32-C3",
+  "flashSize": "8MB",
+  "images": [
+    {"offset": "0x0", "path": "bootloader.bin", "size": 18512, "sha256": "c1f9e5fef52c8a1b066bb8070165d817d47640d6873616c888e3c3817c0bb88a"},
+    {"offset": "0x8000", "path": "partition-table.bin", "size": 3072, "sha256": "1a3bd438966ba7562c5d78e919828a8f31f126e0374c1090b405da80a91f0437"},
+    {"offset": "0x10000", "path": "app.bin", "size": 2454624, "sha256": "9d2b59f5ada587437de218c2428afddf767a3aa3180f636dcee32138602bf49d"}
+  ]
+}

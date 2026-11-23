@@ -119,6 +119,12 @@ enum BluetoothIssue: Equatable {
 enum SetupIssue: Hashable, Identifiable {
     case accessibility
     case bluetoothDenied
+    /// AI Passport 还没配对过（Lepak 平时只连配对过的那台，所以现在不会去连）。
+    case passportUnpaired
+    /// AI Passport 不认这台 Mac 了（Mac 上的配对被删了）：设备上长按 ▼，再重新配对。
+    case passportRejected
+    /// AI Passport 清掉了配对，Mac 还记着旧的：先在系统蓝牙设置里删掉它，再重新配对。
+    case passportPairingRemoved
 
     var id: Self { self }
 }
@@ -143,8 +149,24 @@ final class SettingsModel: ObservableObject {
     }
     /// 「添加设备」弹窗走到哪一步；nil 是没打开。
     @Published var addDeviceStep: AddDeviceStep? {
-        didSet { activeDevicesMayHaveChanged() }
+        didSet {
+            activeDevicesMayHaveChanged()
+            passportPairingMayHaveChanged()
+        }
     }
+    /// 弹窗第二步是在给已添加的 AI Passport「重新配对」（标题不同，没有名称框，完成时只是关掉）。
+    @Published private(set) var repairingPassport = false
+    /// 有没有配对过的 AI Passport。Lepak 平时只连配对过的那台，别人的设备不碰。
+    @Published private(set) var passportPaired = true
+    /// AI Passport 的固件有没有配对保护（Lepak 固件）；nil 是还没握手过。
+    @Published private(set) var passportProtected: Bool?
+    /// 配对过的 AI Passport 不肯握手（两边配对记录对不上）；nil 是没有这个问题。
+    @Published private(set) var passportRejection: PassportRejection?
+    /// AI Passport 的配对模式：弹窗第二步停在 AI Passport 上时打开，这时才会去连附近还没配对的设备。
+    var onPassportPairingChange: ((Bool) -> Void)?
+    /// 「重新配对」：忘掉配对过的那台。
+    var onPassportForget: (() -> Void)?
+    private var lastPassportPairing = false
     /// 弹窗第二步里的「名称」输入框，默认是型号名（以前起过名字就是那个名字）。
     @Published var newDeviceName = ""
     /// 等用户确认要不要移除的设备（弹出确认框）；nil 是没在问。
@@ -260,6 +282,33 @@ final class SettingsModel: ObservableObject {
         onActiveDevicesChange?(active)
     }
 
+    private func passportPairingMayHaveChanged() {
+        let on = addDeviceStep == .connect(.passport)
+        guard on != lastPassportPairing else { return }
+        lastPassportPairing = on
+        onPassportPairingChange?(on)
+    }
+
+    /// 「重新配对」：忘掉现在配对过的那台，打开弹窗第二步，让手上那台配对（Mac 会弹出系统的配对窗口）。
+    func beginRepairPassport() {
+        mappingUI.closeEditor()
+        repairingPassport = true
+        onPassportForget?()
+        addDeviceStep = .connect(.passport)
+    }
+
+    func updatePassportPaired(_ paired: Bool) {
+        passportPaired = paired
+    }
+
+    func updatePassportProtection(_ protected: Bool) {
+        passportProtected = protected
+    }
+
+    func updatePassportRejection(_ rejection: PassportRejection?) {
+        passportRejection = rejection
+    }
+
     func isAdded(_ kind: DeviceKind) -> Bool {
         config.devices.contains(kind)
     }
@@ -305,6 +354,11 @@ final class SettingsModel: ObservableObject {
     /// 先加进列表再关弹窗，连接不会因为离开第二步而断一下。
     func finishAddDevice() {
         guard case .connect(let kind) = addDeviceStep else { return }
+        if repairingPassport {
+            repairingPassport = false
+            addDeviceStep = nil
+            return
+        }
         var next = config
         Self.store(newDeviceName, for: kind, in: &next)
         if !next.devices.contains(kind) { next.devices.append(kind) }
@@ -315,6 +369,7 @@ final class SettingsModel: ObservableObject {
 
     /// 关掉弹窗。第二步里试连的设备（还没点「完成」）随之断开。
     func cancelAddDevice() {
+        repairingPassport = false
         addDeviceStep = nil
     }
 
@@ -412,6 +467,11 @@ final class SettingsModel: ObservableObject {
         if kinds.contains(.passport),
            bluetoothAuthorization == .denied || bluetoothAuthorization == .restricted || passport.bluetooth == .denied {
             issues.append(.bluetoothDenied)
+        }
+        if kinds.contains(.passport), !passportPaired {
+            issues.append(.passportUnpaired)
+        } else if kinds.contains(.passport), let rejection = passportRejection {
+            issues.append(rejection == .removedOnDevice ? .passportPairingRemoved : .passportRejected)
         }
         return issues
     }

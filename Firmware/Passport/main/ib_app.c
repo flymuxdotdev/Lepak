@@ -1,0 +1,1160 @@
+// main/ib_app.c: VibeKey 应用核心(状态机)。
+//
+// 线程模型:
+//   button 组件任务    ib_app_on_button()   只投递按键事件
+//   USB 接收任务       on_usb_line()        解析命令后投递
+//   NimBLE host 任务   on_ble_line/link()   解析命令或订阅变化后投递
+//   ib_app 任务        app_task()           唯一消费者:发送协议消息、驱动 UI / 音频 / 背光、读电量
+// 应用状态只在 ib_app 任务中读写,不需要额外的锁。麦克风帧由 ib_audio 的麦克风任务直接经 audio_tx() 发送。
+//
+// 时序要点:
+//   - 15 s 没收到命令、bye、USB 拔线、BLE 断开 → 对应链路离线;两条都离线 → OFFLINE 时钟页并停麦克风。
+//     USB 拔线按 SOF 检测,连续 1 s 不在位才算(ib_links_usb_present 去抖),短暂中断不会闪出离线页。
+//   - 离线不清除 Mac 最后下发的状态(st / mode / msg),恢复在线后直接回到对应页面;
+//     done / err 这类短暂结果页在离线时直接收拢到常驻页。重启后的初始状态是 idle。
+//   - 点亮屏幕的来源:按键、state 变化、Agent 通知、链路由离线变在线。config(Mac 每 5 分钟重发一次
+//     校准时钟)不点亮屏幕;screen_off 改变后按新值从最近一次活动时刻重新计算,立即生效。
+//   - config.mic=1 时,在线、IDLE、非字幕模式下 OK 键按下的瞬间就开始推送麦克风(不等 mic 命令);
+//     2 s 内 Mac 没切到 rec,或 Mac 下发 proc/done/err/sub(以及 600 ms 宽限期之后的 idle)就停止。
+//   - done 页 1.2 s、err 页 2 s 后自行回到 IDLE 动画。
+//   - Agent 通知:done 15 s 后自动关闭;input 每 20 s 重复提示音,直到按键或 clear。
+//   - 列表页:收到 st=list 且收到过 list 命令才显示(两者先后不限);离开 list 状态后旧列表作废。
+#include "ib_app.h"
+
+#include "bsp_battery.h"
+#include "bsp_display.h"
+#include "ib_audio.h"
+#include "ib_ble.h"
+#include "ib_charge.h"
+#include "ib_clock.h"
+#include "ib_keys.h"
+#include "ib_links.h"
+#include "ib_protocol.h"
+#include "ib_ui.h"
+#include "ib_usb.h"
+#include "ib_wallpaper.h"
+#include "ib_wifi.h"
+
+#include "esp_app_desc.h"
+#include "esp_bt.h"
+#include "esp_check.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+
+#include <string.h>
+#include <stdlib.h>
+
+static const char *TAG = "ib_app";
+
+_Static_assert((int)BSP_BTN_UP == (int)IB_KEY_UP && (int)BSP_BTN_DOWN == (int)IB_KEY_DOWN &&
+               (int)BSP_BTN_OK == (int)IB_KEY_OK, "bsp_btn_t and ib_key_t must share the same order");
+_Static_assert((int)IB_UI_KEY_UP == (int)IB_KEY_UP && (int)IB_UI_KEY_DOWN == (int)IB_KEY_DOWN &&
+               (int)IB_UI_KEY_OK == (int)IB_KEY_OK, "ib_ui_key_t and ib_key_t must share the same order");
+
+#define EVENT_QUEUE_LEN      16
+#define PAIR_WINDOW_S        120    // 打开配对窗口后,这么久内新的 Mac 可以配对(见 ib_ble.h)
+#define APP_TASK_STACK       8192
+#define APP_TASK_PRIO        5
+#define LOOP_PERIOD_MS       100
+#define BATTERY_PERIOD_MS    60000
+#define BACKLIGHT_ON         80
+#define DEFAULT_SCREEN_OFF_S 60
+#define DONE_HOLD_MS         1200
+#define ERR_HOLD_MS          2000
+#define MIC_LOCAL_GRACE_MS   600    // 本地开麦后这段时间内收到的 idle 不停麦(Mac 还没来得及切 rec)
+#define MIC_LOCAL_WAIT_MS    2000   // 本地开麦后 Mac 迟迟不切 rec 就停麦
+#define MIC_TAIL_MS          500    // 离开 rec 进入 proc 后继续推流的最长时间(Mac 要录完尾音,等它发 mic off)
+#define AGENT_DONE_MS        15000
+#define AGENT_CHIME_MS       20000
+#define BLE_FALLBACK_MS      25000  // Wi-Fi 配置存在但 25 秒拿不到 IP 时切 BLE 单栈
+
+typedef enum {
+    EV_KEY,
+    EV_COMMAND,
+    EV_LINK,
+    EV_PAIR_CODE,           // 蓝牙配对码要显示 / 收起
+    EV_PAIR_OPEN,           // USB 命令:打开配对窗口
+    EV_PAIR_FORGET,         // USB 命令:忘掉所有配对过的 Mac
+} ev_type_t;
+
+typedef struct {
+    ev_type_t type;
+    ib_link_t link;         // EV_COMMAND
+    ib_key_t key;           // EV_KEY
+    ib_key_ev_t key_ev;     // EV_KEY
+    bool subscribed;        // EV_LINK
+    int32_t code;           // EV_PAIR_CODE:0..999999,-1 表示收起
+    ib_cmd_t cmd;           // EV_COMMAND
+} app_event_t;
+
+static QueueHandle_t s_queue;
+static bool s_ui_ok;
+static bool s_battery_ok;
+static bool s_audio_ok;
+static uint32_t s_boot_id;
+static char s_build_id[IB_BUILD_ID_LEN + 1];   // ELF SHA-256 前 8 位,hello 里上报
+static uint32_t s_seq;
+
+// 链路
+static ib_links_t s_links;
+static bool s_online;
+static bool s_usb_present;
+static bool s_ble_subscribed;
+static int s_ui_link = -1;
+static int s_ui_online = -1;
+
+// Mac 下发的设置
+static bool s_cfg_mic;
+static bool s_cfg_sound = true;
+static int64_t s_screen_off_ms = DEFAULT_SCREEN_OFF_S * 1000;
+
+// Mac 下发的状态与当前显示
+static ib_state_t s_st = IB_ST_IDLE;
+static ib_mode_t s_mode = IB_MODE_DICT;
+// 「常驻」页面:最近一次 idle / sub 状态的模式、页面和 msg。done / err 自动返回时回到这里,
+// 而不是 rec / proc 带来的听写模式和默认空闲页(否则字幕模式或字幕运行时会短暂闪出错误的页面)。
+static ib_mode_t s_home_mode = IB_MODE_DICT;
+static ib_state_t s_home_st = IB_ST_IDLE;
+static char s_home_msg[IB_TEXT_MAX];
+static int64_t s_mic_tail_until;
+static char s_msg[IB_TEXT_MAX];
+static char s_caption_src[IB_CAPTION_MAX];
+static char s_caption_dst[IB_CAPTION_MAX];
+static char s_caption_app[IB_CAPTION_APP_MAX];
+static bool s_caption_live;
+// OFFLINE 页按 OK 请求 Mac 重新握手;CONNECTING → NO RESPONSE → 可再次尝试。
+static int64_t s_wake_until;
+static bool s_wake_failed;
+// OFFLINE 页本地网络列表：不经过 Mac，直接切 NVS 中的 active 网络后重启。
+#define WIFI_MENU_TIMEOUT_MS 30000
+static bool s_wifi_menu;
+static bool s_wifi_menu_ok;
+static uint8_t s_wifi_menu_sel;
+static int64_t s_wifi_menu_touched;
+static ib_ui_screen_t s_wifi_menu_return;
+static int64_t s_wifi_restart_at;
+static bool s_ble_only;
+static bool s_ble_manual;
+static int64_t s_wifi_missing_since;
+static const char *offline_hint(void);
+static ib_ui_screen_t screen_for(ib_state_t st);
+_Static_assert(IB_CAPTION_MAX == IB_UI_CAPTION_MAX, "caption buffer size mismatch");
+_Static_assert(IB_CAPTION_APP_MAX == IB_UI_CAPTION_APP_MAX, "caption app buffer size mismatch");
+static ib_ui_screen_t s_screen = IB_UI_OFFLINE;
+static int64_t s_revert_at;             // done/err 自动回 IDLE 的时刻,0 表示无
+static bool s_list_ready;               // 收到过当前这轮的 list 命令
+static int64_t s_restart_at;            // 壁纸写入成功后延迟重启,先让 ack 发出去
+
+// 按键
+static ib_keys_t s_keys;
+
+// 麦克风:本地(OK 键)开启时记下时刻,等待 Mac 切到 rec 确认
+static bool s_mic_local;
+static int64_t s_mic_local_ms;
+// 熄屏时 OK 直接开麦:在 Mac 确认 rec 前锁住 REC 页,别让迟到的 idle / usage 覆盖。
+static bool s_mic_prestart;
+static bool s_mic_prestart_long;
+
+// Agent 通知
+static bool s_agent_on;
+static ib_agent_ev_t s_agent_kind;
+static int64_t s_agent_deadline;        // done 自动关闭时刻
+static int64_t s_agent_next_chime;      // input 下次提醒时刻
+
+// 背光
+static bool s_backlight_on;
+static int64_t s_last_activity_ms;
+
+// 电量:s_soc / s_mv 是电量计原始读数;s_charge_view 是经 ib_charge 推断后显示 / 上报的电量与充电状态。
+static int s_soc = -1;
+static int s_mv = -1;
+static ib_charge_t s_charge;
+static ib_charge_view_t s_charge_view = { .soc = -1, .charging = false };
+static int64_t s_last_battery_ms;
+
+// 时钟:Mac 下发本地时间时记下当时的 esp_timer 读数,之后按流逝时间推算
+static bool s_clock_valid;
+static uint32_t s_clock_local;
+static int64_t s_clock_synced_ms;
+static int64_t s_clock_minute = -1;
+
+static int64_t now_ms(void)
+{
+    return esp_timer_get_time() / 1000 + 1;     // +1:保证非 0(ib_links 用 0 表示离线)
+}
+
+// ---------------------------------------------------------------------------
+// 事件生产者(其它任务):只投递,不阻塞。
+// ---------------------------------------------------------------------------
+
+void ib_app_on_button(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
+{
+    (void)user;
+    if (!s_queue || (unsigned)btn >= IB_KEY_COUNT) return;
+    app_event_t event = { .type = EV_KEY, .key = (ib_key_t)btn };
+    switch (ev) {
+    case BSP_BTN_PRESS: event.key_ev = IB_KEY_EV_DOWN; break;
+    case BSP_BTN_RELEASE: event.key_ev = IB_KEY_EV_UP; break;
+    case BSP_BTN_LONG: event.key_ev = IB_KEY_EV_LONG; break;
+    case BSP_BTN_EXTRA_LONG: event.key_ev = IB_KEY_EV_EXTRA_LONG; break;
+    default: return;
+    }
+    xQueueSend(s_queue, &event, 0);
+}
+
+static void post_command(ib_link_t link, const char *line, size_t len)
+{
+    // 壁纸命令带 384 字符 base64，ib_cmd_t 约 1.1 KB。接收任务(USB / BLE / Wi-Fi)的栈
+    // 不够放大对象，改在堆上解析；xQueueSend 会复制进队列，随后即可释放。
+    app_event_t *event = calloc(1, sizeof(*event));
+    if (!event) return;
+    event->type = EV_COMMAND;
+    event->link = link;
+    if (!ib_parse_command(line, len, &event->cmd) || !s_queue) {
+        free(event);
+        return;     // 非法或未知命令整条丢弃
+    }
+    xQueueSend(s_queue, event, 0);
+    free(event);
+}
+
+// 配对相关的事件同样在堆上组装(app_event_t 约 1.1 KB,见 post_command)。
+static void post_pair_event(ev_type_t type, int32_t code)
+{
+    app_event_t *event = calloc(1, sizeof(*event));
+    if (!event) return;
+    event->type = type;
+    event->code = code;
+    if (s_queue) xQueueSend(s_queue, event, 0);
+    free(event);
+}
+
+// 配对管理只走 USB(插着线说明人就在设备旁边):
+//   {"cmd":"pair","op":"open"}    打开配对窗口,让新的 Mac 配对
+//   {"cmd":"pair","op":"forget"}  忘掉所有配对过的 Mac
+// 回 {"t":"pair","st":"open"} / {"t":"pair","st":"forgot"}。只认这两行原样的写法(Lepak 就这么发)。
+static bool handle_pair_usb_line(const char *line, size_t len)
+{
+    while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == '\n' || line[len - 1] == ' ')) len--;
+    static const char OPEN[] = "{\"cmd\":\"pair\",\"op\":\"open\"}";
+    static const char FORGET[] = "{\"cmd\":\"pair\",\"op\":\"forget\"}";
+    if (len == sizeof(OPEN) - 1 && memcmp(line, OPEN, len) == 0) {
+        post_pair_event(EV_PAIR_OPEN, 0);
+    } else if (len == sizeof(FORGET) - 1 && memcmp(line, FORGET, len) == 0) {
+        post_pair_event(EV_PAIR_FORGET, 0);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+static void on_usb_line(const char *line, size_t len)
+{
+    if (handle_pair_usb_line(line, len)) return;
+    if (!ib_wifi_handle_usb_line(line, len)) post_command(IB_LINK_USB, line, len);
+}
+
+// 运行在 NimBLE host 任务里(配对流程的调用栈很深):只投递,由 app 任务更新屏幕。
+static void on_ble_pair(int32_t code)
+{
+    post_pair_event(EV_PAIR_CODE, code);
+}
+
+static void on_ble_line(const char *line, size_t len)
+{
+    if (!ib_wifi_handle_control_line(line, len, false)) post_command(IB_LINK_BLE, line, len);
+}
+
+static void on_ble_link(bool subscribed)
+{
+    app_event_t event = { .type = EV_LINK, .link = IB_LINK_BLE, .subscribed = subscribed };
+    xQueueSend(s_queue, &event, 0);
+}
+
+static void on_wifi_line(const char *line, size_t len)
+{
+    if (!ib_wifi_handle_control_line(line, len, false)) post_command(IB_LINK_WIFI, line, len);
+}
+static void on_wifi_link(bool connected)
+{
+    app_event_t event = { .type = EV_LINK, .link = IB_LINK_WIFI, .subscribed = connected };
+    xQueueSend(s_queue, &event, 0);
+}
+
+// 麦克风帧发送,运行在麦克风任务里。
+static void audio_tx(ib_link_t link, const uint8_t *frame, size_t len)
+{
+    if (link == IB_LINK_USB) {
+        ib_usb_send_bin(frame, len);
+    } else {
+        if (link == IB_LINK_BLE) ib_ble_send_audio(frame, len);
+        else ib_wifi_send_audio(frame, len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 以下只在 ib_app 任务中调用。
+// ---------------------------------------------------------------------------
+
+static void send_to(ib_link_t link, const char *msg, size_t len)
+{
+    if (len == 0) return;
+    if (link == IB_LINK_USB) {
+        ib_usb_send(msg, len);
+    } else {
+        if (link == IB_LINK_BLE) ib_ble_send(msg, len);
+        else ib_wifi_send((const uint8_t *)msg, len);
+    }
+}
+
+// 发给所有在线链路;Mac 用 (boot, seq) 对 key 事件去重。
+static void send_alive(const char *msg, size_t len, int64_t now)
+{
+    for (int i = 0; i < IB_LINK_COUNT; i++) {
+        if (ib_links_alive(&s_links, (ib_link_t)i, now)) send_to((ib_link_t)i, msg, len);
+    }
+}
+
+static void set_backlight(bool on)
+{
+    if (on == s_backlight_on) return;
+    s_backlight_on = on;
+    if (!s_ui_ok) return;
+    bsp_display_backlight(on ? BACKLIGHT_ON : 0);
+    ib_ui_set_awake(on);
+}
+
+static void wake(int64_t now)
+{
+    s_last_activity_ms = now;
+    set_backlight(true);
+}
+
+static void play(ib_sound_t sound)
+{
+    if (s_audio_ok && s_cfg_sound) ib_audio_play(sound);
+}
+
+static ib_ui_mode_t ui_mode(void)
+{
+    return s_mode == IB_MODE_TR ? IB_UI_MODE_TR : s_mode == IB_MODE_SUB ? IB_UI_MODE_SUB : IB_UI_MODE_DICT;
+}
+
+static void show_screen(ib_ui_screen_t screen)
+{
+    s_screen = screen;
+    if (s_ui_ok) ib_ui_show(screen, ui_mode(), s_msg);
+}
+
+static void wifi_menu_update(int64_t now)
+{
+    size_t count = ib_wifi_network_count();
+    if (!count) { s_wifi_menu = false; return; }
+    size_t total = count + 1;       // 最后一个固定是蓝牙模式
+    if (s_wifi_menu_sel >= total) s_wifi_menu_sel = (uint8_t)ib_wifi_active_network();
+    s_wifi_menu_touched = now;
+    if (!s_ui_ok) return;
+    ib_ui_list_t list = { 0 };
+    snprintf(list.title, sizeof(list.title), "WIFI / BLUETOOTH");
+    size_t rows = total > IB_UI_LIST_ROWS ? IB_UI_LIST_ROWS : total;
+    size_t network_rows = count < rows ? count : rows;
+    for (size_t i = 0; i < network_rows; i++) {
+        char ssid[IB_UI_LIST_TEXT_MAX - 2];
+        if (!ib_wifi_network_name(i, ssid, sizeof(ssid))) break;
+        snprintf(list.items[i], sizeof(list.items[i]), "%s%s",
+                 i == ib_wifi_active_network() ? "* " : "  ", ssid);
+    }
+    if (rows > network_rows) snprintf(list.items[network_rows], sizeof(list.items[network_rows]), "  USE BLUETOOTH");
+    list.rows = (uint8_t)rows;
+    list.n = (uint16_t)total;
+    list.top = 0;
+    list.sel = s_wifi_menu_sel;
+    ib_ui_set_list(&list);
+    if (s_screen != IB_UI_LIST) show_screen(IB_UI_LIST);
+}
+
+static void wifi_menu_close(void)
+{
+    s_wifi_menu = false;
+    s_wifi_menu_ok = false;
+    if (!s_online) {
+        if (s_ui_ok) ib_ui_set_offline_hint(offline_hint());
+        show_screen(IB_UI_OFFLINE);
+    } else show_screen(s_wifi_menu_return == IB_UI_OFFLINE ? screen_for(s_st) : s_wifi_menu_return);
+}
+
+static bool wifi_menu_key(ib_key_t key, ib_key_ev_t ev, int64_t now)
+{
+    if (!s_wifi_menu &&
+        ((ev == IB_KEY_EV_EXTRA_LONG && key == IB_KEY_UP) ||
+         (ev == IB_KEY_EV_LONG && key == IB_KEY_DOWN && (!s_online || s_ble_only))) &&
+        (s_screen == IB_UI_IDLE || s_screen == IB_UI_USAGE || s_screen == IB_UI_OFFLINE)) {
+        if (ib_wifi_network_count() == 0) {
+            // Lepak:没配 Wi-Fi(只用蓝牙)时,离线长按 ▼ 打开配对窗口,让新的 Mac 配对。
+            if (key == IB_KEY_DOWN) {
+                ib_ble_open_pairing(PAIR_WINDOW_S);
+                if (s_ui_ok) ib_ui_set_offline_hint("PAIRING ON / ADD IN LEPAK");
+                return true;
+            }
+            if (s_ui_ok) ib_ui_set_offline_hint("USB TO ADD WIFI");
+            return true;
+        }
+        s_wifi_menu_return = s_screen;
+        s_wifi_menu = true;
+        s_wifi_menu_ok = false;
+        s_wifi_menu_sel = (uint8_t)ib_wifi_active_network();
+        // 菜单内按键由固件消费，松开事件不会再经过 ib_keys；清掉底层按下态，避免下一次按键被当成重复 down。
+        ib_keys_reset(&s_keys);
+        wifi_menu_update(now);
+        return true;
+    }
+    if (!s_wifi_menu) return false;
+
+    s_wifi_menu_touched = now;
+    size_t count = ib_wifi_network_count();
+    if (!count) { wifi_menu_close(); return true; }
+    size_t total = count + 1;
+    if (key == IB_KEY_OK) {
+        if (ev == IB_KEY_EV_DOWN) {
+            s_wifi_menu_ok = true;
+        } else if (ev == IB_KEY_EV_LONG) {
+            wifi_menu_close();
+        } else if (ev == IB_KEY_EV_UP && s_wifi_menu_ok) {
+            s_wifi_menu_ok = false;
+            size_t selected = s_wifi_menu_sel;
+            if (selected == count) {
+                s_wifi_menu = false;
+                ib_wifi_request_bluetooth();
+                if (s_ui_ok) ib_ui_set_offline_hint("SWITCHING TO BLUETOOTH...");
+                show_screen(IB_UI_OFFLINE);
+                s_wifi_restart_at = now + 700;
+            // active_network 只是 NVS 里的首选配置；处于 BLE 或 Wi-Fi 离线时，选同一项仍应重启尝试 Wi-Fi。
+            } else if (selected == ib_wifi_active_network()
+                       && ib_links_alive(&s_links, IB_LINK_WIFI, now)) {
+                wifi_menu_close();
+            } else if (ib_wifi_select_network(selected)) {
+                ib_wifi_clear_ble_fallback();
+                s_wifi_menu = false;
+                if (s_ui_ok) ib_ui_set_offline_hint("SWITCHING WI-FI...");
+                show_screen(IB_UI_OFFLINE);
+                s_wifi_restart_at = now + 700;
+            } else if (s_ui_ok) {
+                ib_ui_set_offline_hint("WIFI SWITCH FAILED");
+            }
+        }
+        return true;
+    }
+    if (ev == IB_KEY_EV_DOWN && key == IB_KEY_UP) {
+        s_wifi_menu_sel = s_wifi_menu_sel == 0 ? (uint8_t)(total - 1) : (uint8_t)(s_wifi_menu_sel - 1);
+        wifi_menu_update(now);
+    } else if (ev == IB_KEY_EV_DOWN && key == IB_KEY_DOWN) {
+        s_wifi_menu_sel = (uint8_t)((s_wifi_menu_sel + 1) % total);
+        wifi_menu_update(now);
+    }
+    return true;
+}
+
+// ---- 麦克风 ----
+
+static void mic_stop(void)
+{
+    s_mic_local = false;
+    s_mic_prestart = false;
+    s_mic_prestart_long = false;
+    if (!s_audio_ok || !ib_audio_mic_active()) return;
+    ib_audio_mic_stop();
+    ib_ble_set_audio_mode(false);
+}
+
+static void mic_start(ib_link_t link, bool local, int64_t now)
+{
+    if (!s_audio_ok) return;
+    if (ib_audio_mic_active() && ib_audio_mic_link() != link) mic_stop();
+    if (ib_audio_mic_start(link) != ESP_OK) return;
+    s_mic_prestart = false;
+    s_mic_prestart_long = false;
+    s_mic_local = local;
+    s_mic_local_ms = now;
+    ib_ble_set_audio_mode(link == IB_LINK_BLE);
+}
+
+// ---- Agent 通知 ----
+
+static void agent_clear(void)
+{
+    if (!s_agent_on) return;
+    s_agent_on = false;
+    if (s_ui_ok) ib_ui_agent_hide();
+}
+
+static void agent_show(ib_agent_ev_t kind, const char *source, int64_t now)
+{
+    s_agent_on = true;
+    s_agent_kind = kind;
+    s_agent_deadline = now + AGENT_DONE_MS;
+    s_agent_next_chime = now + AGENT_CHIME_MS;
+    if (s_ui_ok) ib_ui_agent_show(kind == IB_AGENT_DONE ? IB_UI_AGENT_DONE : IB_UI_AGENT_INPUT, source);
+    play(kind == IB_AGENT_DONE ? IB_SOUND_AGENT_DONE : IB_SOUND_AGENT_INPUT);
+    wake(now);
+}
+
+// Agent 全屏通知层是否在接收按键(录音中只显示横幅,按键照常工作)。
+static bool agent_capturing(void)
+{
+    return s_agent_on && s_screen != IB_UI_REC;
+}
+
+// ---- 时钟与电量 ----
+
+static void refresh_clock(int64_t now, bool force)
+{
+    if (!s_ui_ok) return;
+    if (!s_clock_valid) {
+        if (force) ib_ui_set_clock("", "");
+        return;
+    }
+    uint32_t local = s_clock_local + (uint32_t)((now - s_clock_synced_ms) / 1000);
+    int64_t minute = local / 60;
+    if (!force && minute == s_clock_minute) return;
+    s_clock_minute = minute;
+    char t[IB_CLOCK_TIME_LEN];
+    char d[IB_CLOCK_DATE_LEN];
+    ib_clock_format(local, t, d);
+    ib_ui_set_clock(t, d);
+}
+
+static void send_battery(ib_link_t link)
+{
+    char msg[IB_MSG_MAX];
+    send_to(link, msg, ib_format_battery(msg, sizeof(msg), s_charge_view.soc, s_mv, s_charge_view.charging));
+}
+
+static void refresh_battery(int64_t now, bool force)
+{
+    if (!force && now - s_last_battery_ms < BATTERY_PERIOD_MS) return;
+    s_last_battery_ms = now;
+    if (s_battery_ok) {
+        // I2C 读取带 100 ms 超时,放在应用任务里不会阻塞按键回调。
+        s_soc = bsp_battery_soc();
+        s_mv = bsp_battery_mv();
+    }
+    // 板上没有充电状态引脚:由 ib_charge 推断充电中 / 已充满(见 ib_charge.h)。
+    s_charge_view = ib_charge_update(&s_charge, s_usb_present, s_soc, s_mv, now);
+    if (s_ui_ok) ib_ui_set_battery(s_charge_view.soc, s_charge_view.charging);
+    for (int i = 0; i < IB_LINK_COUNT; i++) {
+        if (ib_links_alive(&s_links, (ib_link_t)i, now)) send_battery((ib_link_t)i);
+    }
+}
+
+// Wi-Fi 已配置但始终拿不到 IP 时，重启到 BLE 单栈；C3 内存不足以让两套无线协议栈常驻。
+static void refresh_ble_fallback(int64_t now)
+{
+    if (s_ble_only) {
+        // 自动回退时，插回 USB 说明用户回到电脑旁；手动选蓝牙则尊重用户选择。
+        if (!s_ble_manual && s_usb_present && !s_restart_at) {
+            ib_wifi_clear_ble_fallback();
+            s_restart_at = now + 500;
+        }
+        return;
+    }
+    if (!ib_wifi_is_configured() || s_usb_present || ib_wifi_is_ready()) {
+        s_wifi_missing_since = 0;
+        return;
+    }
+    if (!s_wifi_missing_since) s_wifi_missing_since = now;
+    if (now - s_wifi_missing_since < BLE_FALLBACK_MS || s_restart_at) return;
+    if (s_ui_ok) ib_ui_set_offline_hint("BLUETOOTH MODE...");
+    ib_wifi_request_ble_fallback();
+    s_restart_at = now + 500;
+}
+
+// ---- 状态 ----
+
+static ib_ui_screen_t screen_for(ib_state_t st)
+{
+    switch (st) {
+    case IB_ST_REC: return IB_UI_REC;
+    case IB_ST_PROC: return IB_UI_PROC;
+    case IB_ST_DONE: return IB_UI_DONE;
+    case IB_ST_ERR: return IB_UI_ERR;
+    case IB_ST_SUB: return IB_UI_SUB;
+    case IB_ST_USAGE: return IB_UI_USAGE;
+    // 列表内容还没到时保持当前页面(离线页除外,回到 IDLE),等 list 命令到达再切换。
+    case IB_ST_LIST: return s_list_ready ? IB_UI_LIST : (s_screen == IB_UI_OFFLINE ? IB_UI_IDLE : s_screen);
+    default: return IB_UI_IDLE;
+    }
+}
+
+static void apply_state(const ib_cmd_t *cmd, int64_t now)
+{
+    ib_state_t prev = s_st;
+    s_st = cmd->state;
+    bool prestart_hold = s_mic_prestart && s_mic_local
+        && (s_st == IB_ST_IDLE || s_st == IB_ST_USAGE || s_st == IB_ST_SUB)
+        && now - s_mic_local_ms < MIC_LOCAL_WAIT_MS;
+    if (!prestart_hold) s_mic_prestart = false;
+    if (prev == IB_ST_LIST && s_st != IB_ST_LIST) s_list_ready = false;
+    if (cmd->has_mode) s_mode = cmd->mode;
+    if (cmd->has_msg) {
+        memcpy(s_msg, cmd->msg, sizeof(s_msg));
+    } else {
+        s_msg[0] = '\0';
+    }
+    if (s_st == IB_ST_IDLE || s_st == IB_ST_SUB) {
+        s_home_mode = s_mode;
+        s_home_st = s_st;
+        memcpy(s_home_msg, s_msg, sizeof(s_home_msg));
+    }
+
+    // 提示音:进入录音上行双音;离开录音下行双音;完成短促一声。
+    if (s_st == IB_ST_REC && prev != IB_ST_REC) play(IB_SOUND_START);
+    if (s_st == IB_ST_DONE && prev != IB_ST_DONE) {
+        play(IB_SOUND_DONE);
+    } else if (prev == IB_ST_REC && s_st != IB_ST_REC) {
+        play(IB_SOUND_STOP);
+    }
+
+    // 麦克风:rec 确认本地开麦;其它状态停麦。例外:
+    // - 本地刚开麦时收到的 idle / sub 给一个宽限期(Mac 还没来得及切 rec);
+    // - rec → proc 继续推流,等 Mac 的 mic off(它要录完 150 ms 尾音),最多 MIC_TAIL_MS。
+    if (s_st == IB_ST_REC) {
+        s_mic_local = false;
+        s_mic_tail_until = 0;
+    } else if (s_audio_ok && ib_audio_mic_active()) {
+        bool grace = (s_st == IB_ST_IDLE || s_st == IB_ST_SUB || s_st == IB_ST_USAGE) && s_mic_local
+            && now - s_mic_local_ms < (s_mic_prestart ? MIC_LOCAL_WAIT_MS : MIC_LOCAL_GRACE_MS);
+        bool tail = s_st == IB_ST_PROC && prev == IB_ST_REC;
+        if (tail) {
+            s_mic_tail_until = now + MIC_TAIL_MS;
+        } else if (!grace) {
+            mic_stop();
+        }
+    }
+
+    s_revert_at = s_st == IB_ST_DONE ? now + DONE_HOLD_MS : s_st == IB_ST_ERR ? now + ERR_HOLD_MS : 0;
+    if (!prestart_hold) show_screen(screen_for(s_st));
+    wake(now);
+}
+
+static void apply_list(const ib_cmd_t *cmd)
+{
+    ib_ui_list_t list;
+    memset(&list, 0, sizeof(list));
+    _Static_assert(IB_UI_LIST_ROWS == IB_LIST_ROWS, "list row count mismatch");
+    _Static_assert(sizeof(list.title) == IB_LIST_TEXT_MAX && sizeof(list.items[0]) == IB_LIST_TEXT_MAX,
+                   "list text size");
+    memcpy(list.title, cmd->list_title, sizeof(list.title));
+    memcpy(list.items, cmd->list_item, sizeof(list.items));
+    list.rows = cmd->list_rows;
+    list.n = cmd->list_n;
+    list.top = cmd->list_top;
+    list.sel = cmd->list_sel;
+    if (s_ui_ok) ib_ui_set_list(&list);
+    s_list_ready = true;
+    if (s_st == IB_ST_LIST && s_screen != IB_UI_LIST) show_screen(IB_UI_LIST);
+}
+
+// done / err 结果页结束:状态回到常驻页面(idle 或字幕页)和它的模式、msg,只改状态不切页面。
+// Mac 随后的 state 会再确认一次。
+static void revert_home(void)
+{
+    s_revert_at = 0;
+    s_st = s_home_st;
+    s_mode = s_home_mode;
+    memcpy(s_msg, s_home_msg, sizeof(s_msg));
+}
+
+// ---- 链路 ----
+
+// 两条链路都离线:切到 OFFLINE 时钟页,停麦、清 Agent、复位按键。
+// 不清除 Mac 最后下发的状态:恢复在线时 refresh_links 按 s_st 回到原页面(Mac 若重新握手也会重发 state)。
+// 例外:done / err 是短暂结果页,离线期间不会再走 refresh_timers 的自动返回,直接收拢到常驻页,
+// 否则恢复在线后会停在结果页上。列表内容作废(s_list_ready 清零),等 Mac 重新下发 list。
+static const char *offline_hint(void)
+{
+    // Lepak:先说配对状态。没配对过任何 Mac / 配对窗口开着,都是在等 Mac 来配对。
+    if (ib_ble_pairing_open()) return ib_ble_is_paired() ? "PAIRING ON / ADD IN LEPAK" : "NOT PAIRED / ADD IN LEPAK";
+    if (s_usb_present) return "USB LINKED / OPEN VIBEKEY";
+    if (s_ble_subscribed) return "BLE LINKED / OPEN LEPAK";
+    if (s_ble_only) return "BLUETOOTH MODE / HOLD DOWN";
+    if (ib_wifi_is_configured()) return "WIFI READY / OPEN VIBEKEY";
+    return "PLUG USB OR SET UP WIFI";
+}
+
+static void go_offline(void)
+{
+    mic_stop();
+    agent_clear();
+    ib_keys_reset(&s_keys);
+    if (s_st == IB_ST_DONE || s_st == IB_ST_ERR) revert_home();
+    s_revert_at = 0;
+    s_mic_tail_until = 0;
+    s_list_ready = false;
+    s_wake_until = 0;
+    s_wake_failed = false;
+    if (s_ui_ok) {
+        ib_ui_set_ok_held(false);
+        ib_ui_set_level(0);
+        ib_ui_set_offline_hint(offline_hint());
+    }
+    // 用户可能正在网络菜单里切网；链路刚掉时保留菜单，关掉后再落到离线页。
+    if (!s_wifi_menu) {
+        s_wifi_menu_ok = false;
+        show_screen(IB_UI_OFFLINE);
+    }
+    refresh_clock(now_ms(), true);
+}
+
+static void refresh_links(int64_t now)
+{
+    // SOF 检测会短暂误报不在位,经 1 s 去抖后才认为拔线(见 IB_USB_ABSENT_CONFIRM_MS)。
+    bool usb = ib_links_usb_present(&s_links, ib_usb_host_present(), now);
+    if (!usb) {
+        // 拔线收不到 bye:确认拔线后清除 USB 链路;Mac 此刻开始扫 BLE,切快速广播。
+        ib_links_drop(&s_links, IB_LINK_USB);
+        if (s_usb_present) ib_ble_boost_advertising();
+    }
+    if (usb != s_usb_present) {
+        s_usb_present = usb;
+        refresh_battery(now, true);     // 更新充电图标
+        if (!s_online && s_ui_ok && s_wake_until == 0) {
+            ib_ui_set_offline_hint(offline_hint());
+        }
+    }
+
+    bool online = ib_links_any(&s_links, now);
+    if (online != s_online) {
+        s_online = online;
+        if (online) {
+            s_wake_until = 0;
+            s_wake_failed = false;
+            // 菜单打开时不要被链路恢复事件顶掉；关闭菜单时再恢复原页面。
+            if (!s_wifi_menu) {
+                s_wifi_menu_ok = false;
+                show_screen(screen_for(s_st));      // 回到离线前 Mac 下发的页面
+            }
+            wake(now);                          // 真正重连,用户需要看到
+        } else {
+            // 离线不点亮:Mac 睡眠时 SOF 停止,去抖后设备离线;此时亮屏会表现为"熄了又自己亮"。
+            go_offline();
+        }
+    }
+
+    // 麦克风所在链路断开时停止。
+    if (s_audio_ok && ib_audio_mic_active() && !ib_links_alive(&s_links, ib_audio_mic_link(), now)) mic_stop();
+
+    ib_link_t pref = ib_links_preferred(&s_links, now);
+    ib_ui_link_t ui_link;
+    if (pref == IB_LINK_USB || (pref == IB_LINK_COUNT && usb)) {
+        ui_link = IB_UI_LINK_USB;
+    } else if (pref == IB_LINK_WIFI) {
+        ui_link = IB_UI_LINK_WIFI;
+    } else if (pref == IB_LINK_BLE || s_ble_subscribed) {
+        ui_link = IB_UI_LINK_BLE;
+    } else {
+        ui_link = IB_UI_LINK_NONE;
+    }
+    if ((int)ui_link != s_ui_link || (int)online != s_ui_online) {
+        s_ui_link = (int)ui_link;
+        s_ui_online = (int)online;
+        if (s_ui_ok) ib_ui_set_link(ui_link, online);
+    }
+}
+
+// ---- 事件处理 ----
+
+static void handle_key(ib_key_t key, ib_key_ev_t ev, int64_t now)
+{
+    bool dark = !s_backlight_on;
+    bool defer_wake = dark && s_online && key == IB_KEY_OK && s_cfg_mic && s_audio_ok
+        && (s_screen == IB_UI_IDLE || s_screen == IB_UI_USAGE) && s_mode != IB_MODE_SUB && !agent_capturing();
+    if (ev == IB_KEY_EV_DOWN) {
+        if (!defer_wake) wake(now);
+        if (s_ui_ok && !dark) ib_ui_key_press((ib_ui_key_t)key);
+    }
+    if (wifi_menu_key(key, ev, now)) return;
+    if (ev == IB_KEY_EV_DOWN && key == IB_KEY_OK && !s_online && s_screen == IB_UI_OFFLINE) {
+        char msg[IB_MSG_MAX];
+        size_t len = ib_format_wake(msg, sizeof(msg));
+        bool has_link = s_usb_present || s_ble_subscribed || ib_usb_host_present() || ib_wifi_is_configured();
+        if (len) {
+            if (s_usb_present || ib_usb_host_present()) ib_usb_send(msg, len);
+            if (s_ble_subscribed) ib_ble_send(msg, len);
+            if (ib_wifi_is_configured()) ib_wifi_send((const uint8_t *)msg, len);
+        }
+        if (s_ui_ok) ib_ui_set_offline_hint(has_link ? "CONNECTING..." : "CHECK USB CABLE");
+        s_wake_until = has_link ? now + 3000 : 0;
+        s_wake_failed = false;
+        ib_keys_reset(&s_keys);
+        return;
+    }
+    bool voice_page = (s_screen == IB_UI_IDLE || s_screen == IB_UI_USAGE) && s_mode != IB_MODE_SUB;
+    bool wake_to_talk = ib_keys_wake_to_talk(key, voice_page, agent_capturing());
+    ib_key_action_t act = ib_keys_handle(&s_keys, key, ev, now, s_online, dark && !wake_to_talk, agent_capturing());
+    if (act.dismiss_agent) agent_clear();
+    if (act.send) {
+        char msg[IB_MSG_MAX];
+        send_alive(msg, ib_format_key(msg, sizeof(msg), key, ev, act.ack, ++s_seq, s_boot_id), now);
+    }
+    if (key != IB_KEY_OK) return;
+
+    // 以屏幕为准判断"空闲":done/err 自行回到常驻页后 Mac 的状态可能还没到,此时按 OK 也应立即开麦。
+    // 字幕在运行时(听写 / 翻译模式)显示的是字幕页,OK 同样是说话。
+    if (ev == IB_KEY_EV_DOWN && act.send && !act.ack && s_cfg_mic &&
+        (s_screen == IB_UI_IDLE || s_screen == IB_UI_SUB || s_screen == IB_UI_USAGE) &&
+        s_mode != IB_MODE_SUB && s_audio_ok && !ib_audio_mic_active()) {
+        // Passport 麦克风作为听写音源:按下瞬间就开始推流,不等 Mac 的 mic 命令,减少首字丢失。
+        ib_link_t link = ib_links_preferred(&s_links, now);
+        if (link != IB_LINK_COUNT) mic_start(link, true, now);
+        if (defer_wake && ib_audio_mic_active()) {
+            s_mic_prestart = true;
+            s_mic_prestart_long = false;
+            show_screen(IB_UI_REC);
+        }
+    }
+    if (ev == IB_KEY_EV_DOWN && defer_wake) wake(now);
+    if (ev == IB_KEY_EV_LONG && key == IB_KEY_OK && s_mic_prestart) s_mic_prestart_long = true;
+    if (ev == IB_KEY_EV_UP && key == IB_KEY_OK && s_mic_prestart && !s_mic_prestart_long) {
+        mic_stop();
+        if (s_screen == IB_UI_REC) show_screen(screen_for(s_st));
+    }
+    if (s_ui_ok && ev != IB_KEY_EV_LONG) ib_ui_set_ok_held(ev == IB_KEY_EV_DOWN && act.send);
+}
+
+static void handle_command(ib_link_t link, const ib_cmd_t *cmd, int64_t now)
+{
+    char msg[IB_MSG_MAX];
+    if (cmd->type == IB_CMD_BYE) {
+        ib_links_drop(&s_links, link);
+        refresh_links(now);
+        return;
+    }
+    ib_links_seen(&s_links, link, now);
+    refresh_links(now);         // 可能刚变为在线
+
+    switch (cmd->type) {
+    case IB_CMD_HELLO:
+        send_to(link, msg,
+                ib_format_hello(msg, sizeof(msg), esp_app_get_description()->version, s_build_id, s_boot_id));
+        send_battery(link);
+        if (link == IB_LINK_USB) ib_wifi_report_status();
+        break;
+    case IB_CMD_PING:
+        send_to(link, msg, ib_format_pong(msg, sizeof(msg)));
+        break;
+    case IB_CMD_CONFIG:
+        if (cmd->has_mic) s_cfg_mic = cmd->mic;
+        if (cmd->has_sound) s_cfg_sound = cmd->sound;
+        if (cmd->has_screen_off) s_screen_off_ms = (int64_t)cmd->screen_off_s * 1000;
+        if (cmd->has_engine && s_ui_ok) ib_ui_set_engine(cmd->engine);
+        if (cmd->has_clock) {
+            s_clock_valid = true;
+            s_clock_local = cmd->clock;
+            s_clock_synced_ms = now;
+            refresh_clock(now, true);
+        }
+        // 不 wake:config 是设置同步 / 定期校时,不是用户活动。screen_off 变化由 refresh_backlight 按新值立即生效。
+        break;
+    case IB_CMD_STATE:
+        apply_state(cmd, now);
+        break;
+    case IB_CMD_LEVEL:
+        if (s_ui_ok) ib_ui_set_level(cmd->level);
+        break;
+    case IB_CMD_MIC:
+        if (cmd->on) {
+            mic_start(link, false, now);
+        } else {
+            mic_stop();
+        }
+        break;
+    case IB_CMD_KEYS:
+        for (int k = 0; k < IB_KEY_COUNT; k++) {
+            if (cmd->has_key_icon[k] && s_ui_ok) ib_ui_set_key_icon((ib_ui_key_t)k, cmd->key_icon[k]);
+        }
+        break;
+    case IB_CMD_AGENT:
+        if (cmd->agent_ev == IB_AGENT_CLEAR) {
+            agent_clear();
+        } else {
+            agent_show(cmd->agent_ev, cmd->has_msg ? cmd->msg : "", now);
+        }
+        break;
+    case IB_CMD_LIST:
+        apply_list(cmd);
+        break;
+    case IB_CMD_USAGE: {
+        ib_ui_usage_t usage;
+        memset(&usage, 0, sizeof(usage));
+        usage.tab = cmd->has_usage_tab ? cmd->usage_tab : 0;
+        usage.left_percent = cmd->has_usage_left ? cmd->usage_left : 0;
+        usage.has_quota = cmd->has_usage_quota && cmd->usage_quota;
+        usage.five_hour_left_percent = cmd->has_usage_5left ? cmd->usage_5left : 0;
+        usage.has_five_hour_quota = cmd->has_usage_5quota && cmd->usage_5quota;
+        usage.credits = cmd->has_usage_credits ? (int16_t)cmd->usage_credits : -1;
+        usage.ready = cmd->has_usage_ready && cmd->usage_ready;
+        if (cmd->has_usage_app) memcpy(usage.app, cmd->usage_app, sizeof(usage.app));
+        if (cmd->has_usage_today) memcpy(usage.today, cmd->usage_today, sizeof(usage.today));
+        if (cmd->has_usage_week) memcpy(usage.week, cmd->usage_week, sizeof(usage.week));
+        if (cmd->has_usage_total) memcpy(usage.total, cmd->usage_total, sizeof(usage.total));
+        if (cmd->has_usage_reset) memcpy(usage.reset, cmd->usage_reset, sizeof(usage.reset));
+        if (cmd->has_usage_5reset) memcpy(usage.five_hour_reset, cmd->usage_5reset, sizeof(usage.five_hour_reset));
+        if (cmd->has_usage_plan) memcpy(usage.plan, cmd->usage_plan, sizeof(usage.plan));
+        for (int i = 0; i < 2; i++) {
+            if (cmd->has_usage_panel_label[i]) {
+                memcpy(usage.panel_label[i], cmd->usage_panel_label[i], sizeof(usage.panel_label[i]));
+                usage.has_panel = true;
+            }
+            if (cmd->has_usage_panel_value[i]) {
+                memcpy(usage.panel_value[i], cmd->usage_panel_value[i], sizeof(usage.panel_value[i]));
+            }
+            if (cmd->has_usage_panel_percent[i]) {
+                usage.panel_percent[i] = cmd->usage_panel_percent[i];
+                usage.panel_has_percent[i] = true;
+            }
+        }
+        if (cmd->has_usage_panel_detail) memcpy(usage.panel_detail, cmd->usage_panel_detail, sizeof(usage.panel_detail));
+        for (int i = 0; i < 2; i++) {
+            if (cmd->has_usage_panel_row_detail[i]) {
+                memcpy(usage.panel_row_detail[i], cmd->usage_panel_row_detail[i], sizeof(usage.panel_row_detail[i]));
+            }
+        }
+        if (cmd->has_usage_panel_footer_left) memcpy(usage.panel_footer_left, cmd->usage_panel_footer_left, sizeof(usage.panel_footer_left));
+        if (cmd->has_usage_panel_footer_right) memcpy(usage.panel_footer_right, cmd->usage_panel_footer_right, sizeof(usage.panel_footer_right));
+        if (s_ui_ok) ib_ui_set_usage(&usage);
+        break;
+    }
+    case IB_CMD_CAPTION:
+        if (cmd->has_caption_src) memcpy(s_caption_src, cmd->caption_src, sizeof(s_caption_src));
+        if (cmd->has_caption_dst) memcpy(s_caption_dst, cmd->caption_dst, sizeof(s_caption_dst));
+        if (cmd->has_caption_app) memcpy(s_caption_app, cmd->caption_app, sizeof(s_caption_app));
+        s_caption_live = cmd->caption_live;
+        if (s_ui_ok) ib_ui_set_caption(s_caption_src, s_caption_dst, s_caption_app, s_caption_live);
+        break;
+    case IB_CMD_WALLPAPER: {
+        bool ok = false;
+        const char *phase = NULL;
+        if (cmd->wallpaper_clear) {
+            ok = ib_wallpaper_clear() == ESP_OK;
+            phase = "clear";
+        } else if (cmd->wallpaper_finish) {
+            ok = ib_wallpaper_finish() == ESP_OK;
+            phase = "done";
+        } else if (cmd->has_wallpaper_size && cmd->has_wallpaper_crc) {
+            ok = ib_wallpaper_begin(cmd->wallpaper_size, cmd->wallpaper_crc) == ESP_OK;
+            phase = "start";
+        } else if (cmd->has_wallpaper_off && cmd->has_wallpaper_data) {
+            ok = ib_wallpaper_write(cmd->wallpaper_off, cmd->wallpaper_data) == ESP_OK;
+        }
+        if (phase) {
+            send_to(link, msg, ib_format_wallpaper(msg, sizeof(msg), ok, phase));
+            if (ok && (cmd->wallpaper_finish || cmd->wallpaper_clear)) s_restart_at = now + 500;
+        }
+        break;
+    }
+    case IB_CMD_BYE:
+        break;
+    }
+}
+
+// ---- 周期任务 ----
+
+static void refresh_timers(int64_t now)
+{
+    if (s_restart_at && now >= s_restart_at) esp_restart();
+    if (s_wifi_restart_at && now >= s_wifi_restart_at) esp_restart();
+    if (s_wifi_menu && now - s_wifi_menu_touched >= WIFI_MENU_TIMEOUT_MS) wifi_menu_close();
+    if (s_wake_until && now >= s_wake_until) {
+        if (!s_wake_failed) {
+            s_wake_failed = true;
+            s_wake_until = now + 2000;
+            if (!s_online && s_ui_ok) ib_ui_set_offline_hint("NO RESPONSE - TRY AGAIN");
+        } else {
+            s_wake_until = 0;
+            s_wake_failed = false;
+            if (!s_online && s_ui_ok) ib_ui_set_offline_hint("PRESS OK TO RECONNECT");
+        }
+    }
+    if (s_revert_at && now >= s_revert_at) {
+        s_revert_at = 0;
+        // 离线时 go_offline 已清掉 s_revert_at,这里只会在在线时触发。
+        if (s_online && (s_screen == IB_UI_DONE || s_screen == IB_UI_ERR)) {
+            revert_home();
+            show_screen(screen_for(s_st));
+        }
+    }
+    if (s_mic_local && s_st != IB_ST_REC && now - s_mic_local_ms > MIC_LOCAL_WAIT_MS) {
+        mic_stop();
+        if (s_screen == IB_UI_REC) show_screen(screen_for(s_st));
+    }
+    if (s_mic_tail_until && now >= s_mic_tail_until) {
+        s_mic_tail_until = 0;
+        if (s_st != IB_ST_REC && s_audio_ok && ib_audio_mic_active()) mic_stop();
+    }
+
+    if (s_agent_on) {
+        if (s_agent_kind == IB_AGENT_DONE && now >= s_agent_deadline) {
+            agent_clear();
+        } else if (s_agent_kind == IB_AGENT_INPUT && now >= s_agent_next_chime) {
+            s_agent_next_chime = now + AGENT_CHIME_MS;
+            play(IB_SOUND_AGENT_INPUT);
+            wake(now);
+        }
+    }
+}
+
+static void refresh_backlight(int64_t now)
+{
+    // 录音、处理中、字幕运行中保持常亮;其余时间按 config.screen_off 熄屏(0 为永不)。
+    bool busy = s_online && (s_st == IB_ST_REC || s_st == IB_ST_PROC || s_st == IB_ST_SUB);
+    if (busy) s_last_activity_ms = now;
+    bool on = s_screen_off_ms == 0 || now - s_last_activity_ms < s_screen_off_ms;
+    set_backlight(on);
+}
+
+// ---- 蓝牙配对 ----
+
+// 配对码:大字显示在离线页(配对时还没握手,一定在离线页),点亮屏幕。code < 0 收起。
+static void handle_pair_code(int32_t code, int64_t now)
+{
+    if (!s_ui_ok) return;
+    char text[8] = "";
+    if (code >= 0) snprintf(text, sizeof(text), "%06u", (unsigned)code % 1000000u);
+    ib_ui_set_pair_code(text);
+    if (code < 0) return;
+    wake(now);
+    if (s_wifi_menu) wifi_menu_close();
+    if (!s_online && s_screen != IB_UI_OFFLINE) show_screen(IB_UI_OFFLINE);
+}
+
+static void handle_pair_usb(ev_type_t type)
+{
+    char msg[48];
+    if (type == EV_PAIR_OPEN) {
+        ib_ble_open_pairing(PAIR_WINDOW_S);
+        send_to(IB_LINK_USB, msg, (size_t)snprintf(msg, sizeof(msg), "{\"t\":\"pair\",\"st\":\"open\"}\n"));
+    } else {
+        ib_ble_forget_all();
+        send_to(IB_LINK_USB, msg, (size_t)snprintf(msg, sizeof(msg), "{\"t\":\"pair\",\"st\":\"forgot\"}\n"));
+    }
+}
+
+// 配对窗口开关(含到时自动关)后,离线页底部的提示要跟着变。
+static void refresh_pairing(void)
+{
+    static bool s_was_open;
+    static bool s_was_paired;
+    bool open = ib_ble_pairing_open();
+    bool paired = ib_ble_is_paired();
+    if (open == s_was_open && paired == s_was_paired) return;
+    s_was_open = open;
+    s_was_paired = paired;
+    if (!s_online && s_ui_ok && s_wake_until == 0) ib_ui_set_offline_hint(offline_hint());
+}
+
+static void app_task(void *arg)
+{
+    (void)arg;
+    app_event_t ev;
+    refresh_battery(now_ms(), true);
+    refresh_clock(now_ms(), true);
+    for (;;) {
+        if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(LOOP_PERIOD_MS)) == pdTRUE) {
+            int64_t now = now_ms();
+            switch (ev.type) {
+            case EV_KEY:
+                handle_key(ev.key, ev.key_ev, now);
+                break;
+            case EV_COMMAND:
+                handle_command(ev.link, &ev.cmd, now);
+                break;
+            case EV_LINK:
+                if (ev.link == IB_LINK_BLE) s_ble_subscribed = ev.subscribed;
+                if (!ev.subscribed) ib_links_drop(&s_links, ev.link);
+                if (!s_online && s_ui_ok && s_wake_until == 0) ib_ui_set_offline_hint(offline_hint());
+                break;
+            case EV_PAIR_CODE:
+                handle_pair_code(ev.code, now);
+                break;
+            case EV_PAIR_OPEN:
+            case EV_PAIR_FORGET:
+                handle_pair_usb(ev.type);
+                break;
+            }
+        }
+        int64_t now = now_ms();
+        refresh_pairing();
+        refresh_links(now);
+        refresh_ble_fallback(now);
+        refresh_timers(now);
+        refresh_battery(now, false);
+        refresh_clock(now, false);
+        refresh_backlight(now);
+    }
+}
+
+esp_err_t ib_app_start(bool ui_ok, bool battery_ok)
+{
+    s_ui_ok = ui_ok;
+    s_battery_ok = battery_ok;
+    // 构建标识:esptool elf2image 写进镜像的 ELF SHA-256(小写十六进制),取前 8 位。
+    esp_app_get_elf_sha256(s_build_id, sizeof(s_build_id));
+    ib_links_init(&s_links);
+    ib_keys_reset(&s_keys);
+    ib_charge_init(&s_charge);
+
+    s_queue = xQueueCreate(EVENT_QUEUE_LEN, sizeof(app_event_t));
+    ESP_RETURN_ON_FALSE(s_queue, ESP_ERR_NO_MEM, TAG, "event queue alloc failed");
+
+    ib_wallpaper_init();
+    if (s_ui_ok && ib_ui_init() != ESP_OK) {
+        ESP_LOGE(TAG, "UI init failed, continue without screen");
+        s_ui_ok = false;
+    }
+    wake(now_ms());
+
+    if (ib_usb_start(on_usb_line) != ESP_OK) ESP_LOGE(TAG, "USB link unavailable");
+
+    // BLE 控制器需要 NVS 保存 PHY 校准数据。初始化失败时不擦除分区(避免清掉已有数据),
+    // PHY 退回每次上电完整校准,BLE 照常启动。
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK) ESP_LOGW(TAG, "nvs init failed: %s", esp_err_to_name(err));
+    bool wifi_configured = ib_wifi_is_configured();
+    s_ble_only = wifi_configured && ib_wifi_ble_fallback_requested();
+    s_ble_manual = s_ble_only && ib_wifi_ble_manual_requested();
+    if (!wifi_configured) ib_wifi_clear_ble_fallback();
+    if (s_ble_only) {
+        // Wi-Fi 连续拿不到 IP 后切到 BLE 单栈；Wi-Fi 配网记录仍保留在 NVS。
+        if (ib_ble_start(on_ble_line, on_ble_link, on_ble_pair) != ESP_OK) {
+            ESP_LOGE(TAG, "BLE fallback unavailable, retrying Wi-Fi");
+            ib_wifi_clear_ble_fallback();
+            s_ble_only = false;
+            s_ble_manual = false;
+        }
+    }
+    if (!s_ble_only && wifi_configured) {
+        // 官方 API 释放本轮不使用的 BLE 控制器内存；清除 Wi-Fi 后重启即可恢复 BLE。
+        esp_bt_mem_release(ESP_BT_MODE_BLE);
+    } else if (!s_ble_only && ib_ble_start(on_ble_line, on_ble_link, on_ble_pair) != ESP_OK) {
+        ESP_LOGE(TAG, "BLE link unavailable");
+    }
+    if (!s_ble_only && ib_wifi_start(on_wifi_line, on_wifi_link) != ESP_OK) {
+        ESP_LOGE(TAG, "Wi-Fi link unavailable");
+    }
+
+    // boot id 在 RF 启用之后生成:此时 esp_random() 由射频噪声提供真随机数。
+    s_boot_id = esp_random();
+
+    s_audio_ok = ib_audio_init(audio_tx) == ESP_OK;
+    if (!s_audio_ok) ESP_LOGE(TAG, "audio unavailable");
+
+    BaseType_t ok = xTaskCreate(app_task, "ib_app", APP_TASK_STACK, NULL, APP_TASK_PRIO, NULL);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "app task create failed");
+    return ESP_OK;
+}
