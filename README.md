@@ -1,5 +1,7 @@
 # Lepak
 
+**English** | [简体中文](README_CN.md)
+
 A native macOS menu bar companion app for voice-first hardware controllers — built for **Ulanzi AU05 (Vibe Key)** and **FOLOTOY AI Passport**.
 
 Lepak turns hardware voice buttons, confirm/cancel keys, and rotary knobs into seamless macOS dictation triggers (`Fn` for macOS Dictation / Typeless, etc.) and customizable shortcuts — **with zero system-wide keylogging**.

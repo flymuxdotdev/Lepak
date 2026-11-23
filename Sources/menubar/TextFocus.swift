@@ -36,25 +36,31 @@ enum TextFocus {
     static func decide() -> Decision {
         let system = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(system, timeout)
-        var (app, appError) = copyElement(system, kAXFocusedApplicationAttribute)
+        let appResult = copyElement(system, kAXFocusedApplicationAttribute)
+        var appElement = appResult.0
+        let appError = appResult.1
         var fallback = ""
-        if app == nil, let front = NSWorkspace.shared.frontmostApplication {
+        if appElement == nil, let front = NSWorkspace.shared.frontmostApplication {
             // 系统级查询偶尔会失败（比如超时），退回用前台 App 的进程号。
-            app = AXUIElementCreateApplication(front.processIdentifier)
+            appElement = AXUIElementCreateApplication(front.processIdentifier)
             fallback = "（系统查询失败 \(appError.rawValue)，改用前台进程）"
         }
-        guard let app else {
+        guard let app = appElement else {
             return Decision(moveCaret: false, reason: "取不到前台 App，错误 \(appError.rawValue)")
         }
         AXUIElementSetMessagingTimeout(app, timeout)
         let name = appName(app) + fallback
 
-        var (focused, focusError) = copyElement(app, kAXFocusedUIElementAttribute)
-        if focused.map({ !textRoles.contains(role(of: $0)) }) ?? true, enableAccessibilityTree(of: app) {
+        let focusResult = copyElement(app, kAXFocusedUIElementAttribute)
+        var focusedElement = focusResult.0
+        var focusError = focusResult.1
+        if focusedElement.map({ !textRoles.contains(role(of: $0)) }) ?? true, enableAccessibilityTree(of: app) {
             // Electron / Chromium 默认不开放辅助功能树，打开后再取一次。
-            (focused, focusError) = copyElement(app, kAXFocusedUIElementAttribute)
+            let retry = copyElement(app, kAXFocusedUIElementAttribute)
+            focusedElement = retry.0
+            focusError = retry.1
         }
-        guard let focused else {
+        guard let focused = focusedElement else {
             return Decision(moveCaret: false, reason: "\(name) 没有焦点控件，错误 \(focusError.rawValue)")
         }
         let role = role(of: focused)
